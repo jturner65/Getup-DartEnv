@@ -36,3 +36,7 @@ tutorial/*.html
 # PyCharm project files
 .idea
 vizdoom.ini
+
+gym/envs/dart/New refactored version/
+
+gym/envs/dart/old version before dynamic-displacement constraint and refactoring - use this for displacement policy/
