@@ -1,0 +1,5 @@
+!-- Base Experimental Configurations
+!-- use !-- for comments
+train : False
+clampA : False
+rwds : eefDist,action,height,lFootMovDist,rFootMovDist,comcop,UP_COMVEL,X_COMVEL,Z_COMVEL,kneeAction,matchGoalPose
