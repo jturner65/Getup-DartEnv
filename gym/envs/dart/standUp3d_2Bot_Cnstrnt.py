@@ -61,10 +61,11 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         self.connectBot = True
 
         #initialize all force and trajectory values: extAssistSize=6 will add force application location target to observation
-        #NOTE :if bot is connected, trajectory _MUST_ be passive or explodes
+        #NOTE :if bot is connected and actively solving, trajectory _MUST_ be passive or explodes
         forcePassive = False
-        trajTyp = 'gauss'#'servo'       #servo joint cannot be moved by external force - can train with servo, but to use bot must use freejoint
-        self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp=trajTyp, setTrajDynamic=False, setTrajPassive=(self.connectBot or forcePassive))
+        trajTyp = 'servo'       #servo joint cannot be moved by external force - can train with servo, but to use bot must use freejoint
+        #trajTyp = 'gauss'       #gauss joint cannot be solved dynamically, must be displaced kinematically, or else set to passive
+        self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp=trajTyp, setTrajDynamic=True, setTrajPassive=forcePassive)#(self.connectBot or forcePassive))
         #self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp='gauss', setTrajDynamic=True, setTrajPassive=False)
         
         #whether or not to stop when trajectory is finished
@@ -80,12 +81,12 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         ############################
         # set human/robot conection and motion trajectory object and params  - if train==True then overrides dynamicbot to be false (OPT to solve for location is expensive)
         #self.trainPolicy is defined as static variable in dart_env_2bot TODO make parent class method that enables this to be trained -after- object is instanced
-        #_solvingBot : whether or not helper bot's motion is solved
-        #_botSolving is type of solving Bot should engage in : 0 is IK, 1 is constraint optimization dyn, 2 is IK-SPD 
-        #removed : #_helpingBot : whether or not helper bot is actually coupled to human(i.e. helping by directly applying force)  
-        #build gaussian trajectory
-        SPDGain = 1000   #only used for _botSolving==2,_solvingBot==True
-        self.setTrainAndInitBotState(self.trainPolicy, _solvingBot=True, _botSolving=2, _SPDGain=SPDGain)   
+        #setBotSolve : whether or not helper bot's motion is solved
+        #setBotDynamic : whether bot is set to be dynamically simulated or not (if not mobile is set to false)
+        #botSolvingMethod is type of solving Bot should engage in : 0 is IK, 1 is constraint optimization dyn, 2 is IK-SPD 
+        #spd gain is only used for IK_SPD solve 
+        botDict = defaultdict(int,{'setBotSolve':0, 'setBotDynamic':1, 'botSolvingMethod':2, 'SPDGain':10000000})
+        self.setTrainAndInitBotState(self.trainPolicy, botDict=botDict)    
         #whether this environment uses force as an assistive component or not - default is no
         self.assistIsFrcBased = False
 
@@ -186,7 +187,7 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         bot.frwrdSimBot_DispIKSPD(tarDisp, dbgFrwrdStep=False)
 
         #build an observation, query policy for optimal 
-        ANAObs[-(len(tarDisp)):len(ANAObs)] = tarDisp
+        ANAObs[-(len(tarDisp)):] = tarDisp
         
         #use ANA observation in policy to get appropriate action
         if (policy is None):

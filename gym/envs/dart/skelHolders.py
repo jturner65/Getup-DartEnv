@@ -139,7 +139,7 @@ class skelHolder(ABC):
         ndofs = self.ndofs
         dt = self.perSimStep_dt
         self.Kp_const = SPDGain
-        self.Kd_const = dt * self.Kp_const
+        self.Kd_const = 1.00001*dt * self.Kp_const  #making slightly higher than 1*dt helps with oscillations
         self.Kp_SPD = self.Kp_const * np.identity(ndofs)
         self.Kd_SPD = self.Kd_const * np.identity(ndofs)
         self.zeroKD = np.zeros(ndofs)
@@ -1065,7 +1065,7 @@ class skelHolder(ABC):
             ttlCntctBdyTrque += v.calcTtlBdyTrqs()
         ttlCntctBdyFrcAtEef = JTransInv.dot(ttlCntctBdyTrque)
         #subtract cntct frc @ eef from ttl cnstrnt force @ eef to get external force due to assist
-        #add due to sign of contact forces?
+        #add due to sign of contact forces? different collision detectors seem to have different signs/directions for the contacts they return
         extFrcAtEef = allCnstrntFrcAtEef + ttlCntctBdyFrcAtEef
 
         return extFrcAtEef, allCnstrntFrcAtEef, ttlCntctBdyFrcAtEef
@@ -2463,7 +2463,7 @@ class helperBotSkelHolder(skelHolder, ABC):
     #helper bot will IK to appropriate world position here, and reset init pose    
     def _setToInitPosePriv(self):
         #IK's to initial eff position in world, to set up initial pose, if solving either IK, IK-SPD, or dynamics for helper
-        if(self.initEffPosInWorld is not None) and (self.env.solvingBot):
+        if(self.initEffPosInWorld is not None) and (self.env.botIKtoInitPose()):
             print('helperBotSkelHolder::_setToInitPosePriv :: {} init eff pose exists, IK to it'.format(self.name))
             #init pose here is base configuration to start IK from
             self.skel.set_positions(self.initPose)
@@ -2899,6 +2899,17 @@ class helperBotSkelHolder(skelHolder, ABC):
         self.mimicReachBody = self.mimicBot.body(self.reach_hand)
         #use self.reachBodyOffset to find actual location
 
+    #determine force necessary to frwrd sim ANA with given displacement
+    #then generate it
+    def frwrdSimBot_DispToFrc(self, a, desDisp, dbgFrwrdStep=False):
+        ulj = self.useLinJacob
+        ana = self.helpedSkelH
+        #get current cnstrntFrc on ANA
+        #extFrcAtEef, allCnstrntFrcAtEef, ttlCntctBdyFrcAtEef
+        anaEefPullFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef = ana.getExternalForceAtEef(ulj)
+
+
+
     #first use IK to find new pose for bot to enable desired displacement, then use SPD to move to this pose
     def frwrdSimBot_DispIKSPD(self, desDisp, dbgFrwrdStep=False):
         skel = self.skel
@@ -2913,9 +2924,10 @@ class helperBotSkelHolder(skelHolder, ABC):
         mimicBotEefPos = self.mimicReachBody.to_world(x=self.reachBodyOffset)
         #need to find appropriate IK target position by transferring displacement in bot frame to mimic bot frame 
         mimicBotNewPos = mimicBotEefPos + desDisp
-        print("mimicBotEefPos : {} to go to {}".format(mimicBotEefPos,mimicBotNewPos))
         #solve IK  - IK end effector to passed position (world coords) 
         self.IKtoPassedPos(mimicBotNewPos, skel=self.mimicBot, reachBody=self.mimicReachBody)
+        mimicBotIKEefPos = self.mimicReachBody.to_world(x=self.reachBodyOffset)
+        print("mimicBotEefPos : {} to go to {} : new mimic Eef Pos after IK : {} ".format(mimicBotEefPos,mimicBotNewPos,mimicBotIKEefPos))
         #solve and frwrd integrate helper bot to move the specified delta amount, using IK to find desired q/qdot and then SPD to solver for torques
         #SPD part
         # SPD
@@ -2924,8 +2936,8 @@ class helperBotSkelHolder(skelHolder, ABC):
         botEefCnstrntFrc = self.getEefCnstrntFrc(ulj)
         #extFrcAtEef, allCnstrntFrcAtEef, ttlCntctBdyFrcAtEef
         anaEefPullFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef = ana.getExternalForceAtEef(ulj)
-        print("frwrdSimBot_DispIKSPD : bot c frc @ eef : \t\t{}\tana c frc @ eef : \t\t{}\nana cntct frc @ eef : \t\t{}\t!!!ana frc Pull @ eef : \t{}".format(botEefCnstrntFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef, anaEefPullFrc))
-#        #jacobian to end effector 
+        print("helperBotSkelHolder::frwrdSimBot_DispIKSPD :\n\tbot c frc @ eef : \t\t{}\tana c frc @ eef : \t\t{}\n\tana cntct frc @ eef : \t\t{}\t!!!ana frc Pull @ eef : \t{}".format(botEefCnstrntFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef, anaEefPullFrc))
+#        #jacobian to end effector  
 #        JTransInv, JTrans, Jpull, _ = self.getEefJacobians(useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
 #        bot_JtPullPInv, botJTrans = self.getJInvTrans()
 #        ana_JtPullPInv, _ = self.helpedSkelH.getJInvTrans()
@@ -2953,7 +2965,8 @@ class helperBotSkelHolder(skelHolder, ABC):
         dt = self.perSimStep_dt
         
         #get current pose - this is the pose we want to SPD to - NOTE we do not want root dof locations from mimic bot, if any exist
-        qBar = np.zeros(self.ndofs)
+        #qBar = np.zeros(self.ndofs)
+        qBar = np.copy(q)#retain root to world dofs
         qBar[self.stTauIdx:] = self.mimicBot.q[self.stTauIdx:]
         #we need to derive desired dq by taking starting dq and average dq (Which will result in desired eef displacement == (qBar - orig q)/dt )
         avgDq = (qBar - q)/dt
@@ -2966,13 +2979,15 @@ class helperBotSkelHolder(skelHolder, ABC):
         cnstrntFrc = skel.constraint_forces() 
 
         #spd formulation
-        Mkdts = M + kd_ts
-        invM = np.linalg.inv(Mkdts)
+        invM = np.linalg.inv(M + kd_ts)
         nextPos = q + dq * dt
         p = -mKp.dot(nextPos - qBar)
         #nextVel = dq + ddq * dt
-        d = -mKd.dot(dq - dqBar)               
-        #d = -mKd.dot(dq)# - dqBar)                        
+        d = self.zeroKD # == -mKd.dot(dq - dq)     #setting this makes matching IK stable.
+        #d = -mKd.dot(dq - dqBar)               
+        #d = -mKd.dot(dq)# - dqBar)            
+        print("helperBotSkelHolder::frwrdSimBot_DispIKSPD : d : {}".format(d))            
+        #d = -mKd.dot(avgDq)# - dqBar)                        
         ddq = invM.dot(-CorGrav + p + d + cnstrntFrc)
         #cntrl = p + d - mKd.dot(ddq * dt)
         cntrl = p + d - kd_ts.dot(ddq)
@@ -2982,8 +2997,8 @@ class helperBotSkelHolder(skelHolder, ABC):
         self.tau[:self.stTauIdx] = 0
         #??? TODO only step me forward ???
         #self._stepNoneButMe
-        self.oldDq = np.copy(dq)
-        self.env.pauseForInput("helperBotSkelHolder::frwrdSimBot_DispIKSPD")
+        #self.oldDq = np.copy(dq)
+        #self.env.pauseForInput("helperBotSkelHolder::frwrdSimBot_DispIKSPD")
 
     #solve and frwrd integrate helper bot, to find actual force generated solving for optimization process
     #traj is expected to be evolved before this is called

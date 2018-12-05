@@ -156,7 +156,7 @@ class followTraj(ABC):
         ndofs = self.track_nDofs
         dt = self.dt
         Kp_const = 1000000
-        Kd_const = dt * Kp_const
+        Kd_const = 1.000001 * dt * Kp_const #kd > dt * kp_const increases stability
         self.Kp = Kp_const * np.identity(ndofs)
         #self.Kp[0:3,0:3] = 0
         self.Kd = Kd_const * np.identity(ndofs)
@@ -257,7 +257,10 @@ class followTraj(ABC):
     #set 1 time per ANA control step if evolving ANA's position naturally
     def setNewPosition(self):
         if(self.debug):
-            print("followTraj::setNewPosition : trajStep : {} | avg vel seen : {}".format(self.trajStep,self.tmpVelSum/(1.0+ 1.0*self.frame_skip)))
+            keyList = ["trajStep","avg vel seen"]
+            msgList = [self.trajStep,self.tmpVelSum/(1.0+ 1.0*self.frame_skip)]
+            self.trajPrint("followTraj::setNewPosition : ",keyList, msgList)
+            #print("followTraj::setNewPosition : trajStep : {} | avg vel seen : {}".format(self.trajStep,self.tmpVelSum/(1.0+ 1.0*self.frame_skip)))
         #print("Traj Incr : {}".format(self.trajIncr))
         self._setStartCurLoc()
         #calculate next step's location (changes nextPos)

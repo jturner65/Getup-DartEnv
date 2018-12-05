@@ -40,8 +40,10 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
         #connect bot to constraint
         self.connectBot = False
 
-        #solve bot dynamic tracking using IK-SPD
+        #solve bot dynamic tracking using IK-SPD - this loads copy of bot arm to use as IK template
         self.solveBotIK_SPD = False
+        #solve via assistance
+        self.stepBotAssist = True
 
         #whether or not to stop when trajectory is finished
         self.stopWhenTrajDone = False
@@ -179,16 +181,19 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
     #If training human (or purely consuming trained policy without assistant involvement) : 
     #   robot should be set to not mobile, not connected to constraint ball, and not simulated/solved (although IK to ball might be good for collision info with human)
     #   human needs to get assist force applied -every timestep-
-    #_botSolving is type of solving Bot should engage in : 0 is IK, 1 is constraint optimization dyn, 2 is IK-SPD 
-    #_solvingBot uses IK to traj loc if not Simulated, solves ID if is simulated, if false and dynamic bot arm is ragdoll
+    #botDict vals : 
+    #   setBotSolve : whether or not helper bot's motion is solved
+    #   setBotDynamic : whether bot is set to immobile or not
+    #   botSolvingMethod is type of solving Bot should engage in : 0 is IK, 1 is constraint optimization dyn, 2 is IK-SPD 
+    #   SPDGain is only used for IK_SPD solve 
     #helpingBot is connected to human
-    def setTrainAndInitBotState(self, _train, _solvingBot, _botSolving, _SPDGain):
+    def setTrainAndInitBotState(self, _train, botDict):
         #human is always mobile
         self.skelHldrs[self.humanIdx].setSkelMobile(True)
         #whether we are training or not
         self.trainHuman = _train
         #bot will solve either IK of eef if not active or ID of force gen if active
-        self.solvingBot = _solvingBot
+        self.solvingBot = botDict['setBotSolve'] != 0
         #no assist force for this skel, so no need to set this
         self.skelHldrs[self.humanIdx].setAssistFrcEveryTauApply = False
         #baseline does not solve for IK/SPD
@@ -197,7 +202,7 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
         if (_train):
             # #set to false to enable robot to help, otherwise, set to true if training and applying specific force to robot
             # #must be set before apply_tau unless robot is actively helping
-            #set mobility - turn off mobility of bot during training
+            #set mobility - turn off mobility/dynamic simulation of bot during training
             self.skelHldrs[self.botIdx].setSkelMobile(False) 
             #display ANA reward dbg data - slow, make false if training
             self.dbgANAReward = False
@@ -212,15 +217,16 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
                 hndlr.debug=False      
 
         else : 
+            _botSolvingMethod = botDict['botSolvingMethod']
             #_dynamicBot bot is fwd simulated - set mobile if true, if immobile (false) either does nothing or solves IK
-            if(_botSolving == 0) :  #IK to position
+            if(_botSolvingMethod == 0) :  #IK to position
                 isDynamic = False
-            elif(_botSolving == 1) :    #optimization torque derivation to position
-                isDynamic = _solvingBot
-            elif(_botSolving == 2) :    #IK to find pose; SPD to find torques, to render position/displacement
-                isDynamic = _solvingBot
+            elif(_botSolvingMethod == 1) :    #optimization torque derivation to position
+                isDynamic = botDict['setBotDynamic'] != 0#_solvingBot
+            elif(_botSolvingMethod == 2) :    #IK to find pose; SPD to find torques, to render position/displacement
+                isDynamic = botDict['setBotDynamic'] != 0#__solvingBot
                 #if solving bot control via IK/SPD, setup initial matricies
-                self.setSolveBotIK_SPD(_SPDGain)
+                self.setSolveBotIK_SPD(self.solvingBot,botDict['SPDGain'])
 
             self.skelHldrs[self.botIdx].setSkelMobile(isDynamic)       
 
@@ -243,11 +249,14 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
         self._resetEefLocsAndCnstrnts(True)
 
     #call this to configure assist bot to solve IK to find desired pose and then use SPD to generate torques to meet that pose
-    def setSolveBotIK_SPD(self, SPDGain):
+    def setSolveBotIK_SPD(self, doSolve, SPDGain):
+        #set this so that mirror arm is loaded
         self.solveBotIK_SPD = True
-        self.skelHldrs[self.botIdx].buildSPDMats(SPDGain)
-        #bot is helping
-        self.stepBotAssist = True
+        #if actually solving 
+        if (doSolve):
+            self.skelHldrs[self.botIdx].buildSPDMats(SPDGain)
+            #bot is helping - this calls alternate step function
+            self.stepBotAssist = True
     
     ############################################################
     # Sim Step-related functions
@@ -517,6 +526,14 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
         grabLocs['cnstrntCtr'] = (grabLocs['h_toCnstrnt'] + grabLocs['r_toCnstrnt']) * .5
         #print('\ngetNewGrabLocs : sphere ctr in world : {}|\tto local : {}\n'.format(grabLocs['cnstrntCtr'],self.skelHldrs[self.humanIdx].reachBody.to_local(grabLocs['cnstrntCtr'])))
         return grabLocs
+
+    #whether or not bot should IK to constraint location during reset - called by helperBotSkelHolder::_setToInitPosePriv
+    #should be done if bot is being solved so long as no policy is being trained
+    def botIKtoInitPose(self):
+        if (self.trainHuman):
+            return False
+        
+        return True#self.solvingBot or self.
 
     ####################################################
     # assist functions

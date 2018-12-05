@@ -74,11 +74,12 @@ class DartStandUp3dAssistEnv(assist2bot_env.DartAssist2Bot_Env, utils.EzPickle):
         ############################
         # set human/robot conection and motion trajectory object and params  - if train==True then overrides dynamicbot to be false (OPT to solve for location is expensive)
         #self.trainPolicy is defined as static variable in dart_env_2bot TODO make parent class method that enables this to be trained -after- object is instanced
-        #_solvingBot : whether or not helper bot's motion is solved
-        #_botSolving is type of solving Bot should engage in : 0 is IK, 1 is constraint optimization dyn, 2 is IK-SPD 
-        #removed : #_helpingBot : whether or not helper bot is actually coupled to human(i.e. helping by directly applying force) 
-        #spd gain is only used for IK_SPD solve
-        self.setTrainAndInitBotState(self.trainPolicy, _solvingBot=False, _botSolving=0, _SPDGain=1000)                                
+        #setBotSolve : whether or not helper bot's motion is solved
+        #setBotDynamic : whether bot is set to be dynamically simulated or not (if not mobile is set to false)
+        #botSolvingMethod is type of solving Bot should engage in : 0 is IK, 1 is constraint optimization dyn, 2 is IK-SPD 
+        #spd gain is only used for IK_SPD solve 
+        botDict = defaultdict(int,{'setBotSolve':0, 'setBotDynamic':1, 'botSolvingMethod':0, 'SPDGain':10000000})
+        self.setTrainAndInitBotState(self.trainPolicy, botDict=botDict)                                
         utils.EzPickle.__init__(self)
  
     #individual environment-related components of assist initialization
