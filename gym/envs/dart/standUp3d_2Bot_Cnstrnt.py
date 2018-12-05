@@ -63,9 +63,9 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         #initialize all force and trajectory values: extAssistSize=6 will add force application location target to observation
         #NOTE :if bot is connected and actively solving, trajectory _MUST_ be passive or explodes
         forcePassive = False
-        trajTyp = 'servo'       #servo joint cannot be moved by external force - can train with servo, but to use bot must use freejoint
-        #trajTyp = 'gauss'       #gauss joint cannot be solved dynamically, must be displaced kinematically, or else set to passive
-        self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp=trajTyp, setTrajDynamic=True, setTrajPassive=forcePassive)#(self.connectBot or forcePassive))
+        #trajTyp = 'servo'       #servo joint cannot be moved by external force - can train with servo, but to use bot must use freejoint
+        trajTyp = 'gauss'       #gauss joint cannot be solved dynamically, must be displaced kinematically, or else set to passive
+        self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp=trajTyp, setTrajDynamic=False, setTrajPassive=forcePassive)#(self.connectBot or forcePassive))
         #self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp='gauss', setTrajDynamic=True, setTrajPassive=False)
         
         #whether or not to stop when trajectory is finished
@@ -85,14 +85,14 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         #setBotDynamic : whether bot is set to be dynamically simulated or not (if not mobile is set to false)
         #botSolvingMethod is type of solving Bot should engage in : 0 is IK, 1 is constraint optimization dyn, 2 is IK-SPD 
         #spd gain is only used for IK_SPD solve 
-        botDict = defaultdict(int,{'setBotSolve':0, 'setBotDynamic':1, 'botSolvingMethod':2, 'SPDGain':10000000})
+        botDict = defaultdict(int,{'setBotSolve':1, 'setBotDynamic':1, 'botSolvingMethod':2, 'SPDGain':10000000})
         self.setTrainAndInitBotState(self.trainPolicy, botDict=botDict)    
         #whether this environment uses force as an assistive component or not - default is no
         self.assistIsFrcBased = False
 
         #add mimic bot used to IK
         if (self.solveBotIK_SPD):
-            self.initMimicBot()
+            self.initMimicBot(isDynamic=True)
 
         utils.EzPickle.__init__(self)
         
@@ -102,7 +102,6 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         #self.skelsToRndrWClr= []
         skelTup = (skel,[1.0,0.0,0.0,0.5])
         self.skelsToRndrWClr.append(skelTup)
-    
 
     #set assist objects to be able to collide
     def setAssistObjsCollidable(self):
@@ -117,18 +116,19 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         print("initAssistTraj_indiv : disp bnds : {} ".format(self.dispBnds))
         
     #set up mimic bot - duplicate of helper bot to be used to IK to positions without breaking constraints
-    def initMimicBot(self):
+    #if isDynamic is false (IK_SPD solve), then only used to solve IK; if true then used to synthesize control for desired force
+    def initMimicBot(self, isDynamic=False):
         if (self.helperBotFullPath is None): return
         self.dart_world.add_skeleton(self.helperBotFullPath)
         #mimic skel is last skel added
         mimicSkel = self.dart_world.skeletons[-1]
         mimicSkel.setName("mimicBot")
-        #change colors
+        #change colors - doesnt work due to meshes used to render bot
         self.setRGBAofAltBot(mimicSkel)
         #turn off collisions 
         self._setSkelNoCollide(mimicSkel, mimicSkel.name)
-        #turn off mobile so no frwd sim executed
-        mimicSkel.set_mobile(False)
+        #turn off mobile if not dynamic so no frwd sim executed
+        mimicSkel.set_mobile(isDynamic)
         self.skelHldrs[self.botIdx].setMimicBot(_mimicSkel=mimicSkel)
 
     def _buildIndivAssistObj(self, assistFileName):
@@ -171,23 +171,41 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         #conversely, should check if ANA is done successfully or if ANA failed
         return 0
 
-    #query value function, find ideal assist given ANA's state, find necessary bot control to provide this assist
-    #will set bot's tau, and will return new control for ANA
-    def findBotDispCntrol_IKSPD(self, ANA, bot, ANAObs, policy, useDet):
-        #query VF with current ana state
+    def getANAActionForOptDisp(self, ANAObs, a, policy, useDet):
+        #query VF with current ana state to get optimal displacement
         _,initTardisp,_ = self.getObsComponents(ANAObs)
         tarDisp, _ = self.getTargetAssist(ANAObs)
         #print("Init Tar Disp : {} VF Tar Disp : {}".format(initTardisp, tarDisp))
+        if (np.allclose(initTardisp,tarDisp)):#if not changing traj, then policy won't change either
+            return a, tarDisp
+
         if(not np.allclose(initTardisp, tarDisp)):
-            #tarDisp = initTardisp
+            #TODO forcing target displacement to be initial displacement (i.e. ignoring vf pred) - only do this until vf has been retrained
+            tarDisp = initTardisp
             #set target displacement for tajectory
             self.trackTraj.setVFTrajObs("disp",tarDisp)
+
+        if (policy is None):
+            return a, tarDisp
+        else :
+            action, actionStats = policy.get_action(ANAObs)
+            if(useDet):#deterministic policy - use mean
+                action = actionStats['mean']
+        return action, tarDisp
+
+
+
+    #query value function, find ideal assist displacement given ANA's state, 
+    #frwrd sim ANA to find ext seen at ANA's eef to generate this displacement. restore ANA
+    #find bot control to synthesize this force at eef
+    def findBotDispCntrol_DispFrc(self, ANA, bot, ANAObs, a, policy, useDet):
+        action, tarDisp = self.getANAActionForOptDisp(ANAObs, a, policy, useDet)
+        #get ANA's eef force dictionary for given control, to see how much force the bot should generate 
+        frcDbgDict = self.stepFrwrdThenRestore(action)
             
         #derive the control torque by determining the new pose for the assistant robot given the desired displacement
-        bot.frwrdSimBot_DispIKSPD(tarDisp, dbgFrwrdStep=False)
-
-        #build an observation, query policy for optimal 
-        ANAObs[-(len(tarDisp)):] = tarDisp
+        bot.frwrdSimBot_DispToFrc(frcDbgDict, dbgFrwrdStep=True)
+        #
         
         #use ANA observation in policy to get appropriate action
         if (policy is None):
@@ -196,7 +214,35 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
             action, actionStats = policy.get_action(ANAObs)
             if(useDet):#deterministic policy - use mean
                 action = actionStats['mean']
-        return action            
+        return action      
+    
+    #query value function, find ideal assist given ANA's state, find necessary bot control to provide this assist
+    #will set bot's tau, and will return new control for ANA
+    #Not used
+    # def findBotDispCntrol_IKSPD(self, ANA, bot, ANAObs, policy, useDet):
+    #     #query VF with current ana state
+    #     _,initTardisp,_ = self.getObsComponents(ANAObs)
+    #     tarDisp, _ = self.getTargetAssist(ANAObs)
+    #     #print("Init Tar Disp : {} VF Tar Disp : {}".format(initTardisp, tarDisp))
+    #     if(not np.allclose(initTardisp, tarDisp)):
+    #         #tarDisp = initTardisp
+    #         #set target displacement for tajectory
+    #         self.trackTraj.setVFTrajObs("disp",tarDisp)
+            
+    #     #derive the control torque by determining the new pose for the assistant robot given the desired displacement
+    #     bot.frwrdSimBot_DispIKSPD(tarDisp, dbgFrwrdStep=False)
+
+    #     #build an observation, query policy for optimal 
+    #     ANAObs[-(len(tarDisp)):] = tarDisp
+        
+    #     #use ANA observation in policy to get appropriate action
+    #     if (policy is None):
+    #         return None
+    #     else :
+    #         action, actionStats = policy.get_action(ANAObs)
+    #         if(useDet):#deterministic policy - use mean
+    #             action = actionStats['mean']
+    #     return action            
 
     #TODO need to rebuild all these things to handle constraint displacement and not force            
     #use this to perform per-step bot opt control of force and feed it to ANA - use only when consuming policy
@@ -222,7 +268,8 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
                 self.doneTracking = self.stepTraj(fr)               
 
             ANAObs = ANA.getObs()
-            action = self.findBotDispCntrol_IKSPD(ANA, bot, ANAObs,policy,useDet)
+            action = self.findBotDispCntrol_DispFrc(ANA, bot, ANAObs, a, policy, useDet)
+            #action = self.findBotDispCntrol_IKSPD(ANA, bot, ANAObs,policy,useDet)
             if action is None:
                 action = a
                 print("stepBotForAssist : No Policy set : action used :  {}".format(action))
@@ -256,6 +303,40 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         #self.pauseForInput("stepBotForAssist")
 
         return self.endStepChkANA(avAction,  done, resDict, self.dbgANAReward)
+
+    #this will step forward all skels but will then restore all states, and will not have any lasting effects on skel state
+    #this is done so that frwrd step results can be aggregated and used non-destructively
+    #this is to be called from helper bot
+    def stepFrwrdThenRestore(self, a):
+
+        ANA = self.skelHldrs[self.humanIdx]
+        bot = self.skelHldrs[self.botIdx]
+        #preserve all skel states (q,qdot,qdotdot, tau) and whether bot is active or not;
+        for _,v in self.skelHldrs.items():
+            v._saveSimState()
+
+        #make sure bot is passive exerts no control
+        bot.dbgResetTau()
+
+        #make constraint active and save current state
+        self.trackTraj.saveAndSetActive()
+
+        #apply ANA's tau (only tau that was set) based on passed action proposal
+        ANA.tau = ANA.setClampedTau(a)
+        #forward simulate
+        self.dart_world.step()   
+        #check ANA skel for frc profile
+        frcDbg, _, _ = ANA._calFrcCmpsAtEefForTau(ANA.tau, debug=True)
+
+        #restore constraint state and make constraint passive
+        self.trackTraj.restoreAndSetPassive()
+        #restore all states to pre-step state
+        for _,v in self.skelHldrs.items():
+            v._restoreSimState()
+
+        #return the force the bot should generate
+        return frcDbg
+
 
 
     #individual code for prestep setup, before frames loop

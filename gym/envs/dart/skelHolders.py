@@ -95,6 +95,10 @@ class skelHolder(ABC):
         self.useLinJacob = False
         #Monitor generated force at pull point/hand contact
         self.monitorGenForce = False
+        #whether states have been saved for restore after frwrd step
+        self.saveStateForFwdBkwdStep = False
+
+
 
         #display debug information for this skel holder
         self.debug = True
@@ -133,6 +137,8 @@ class skelHolder(ABC):
         #for kneeless agents
         self.kneeDOFIdxs= []
         self.kneeDOFActIdxs=[]
+
+
 
     #if using SPD to provide control to this holder's skel, call this function on init
     def buildSPDMats(self, SPDGain):
@@ -506,6 +512,8 @@ class skelHolder(ABC):
     
     #return a random initial state for this skeleton
     def getRandomInitState(self, poseDel=None):
+        skel=self.skel
+        rnd = self.env.np_random
         if(poseDel is None):
             poseDel=self.poseDel
         ndofs = self.ndofs
@@ -520,23 +528,24 @@ class skelHolder(ABC):
             #set walker to be laying on ground
             self.setToInitPose()
             #clear velocity!!!!
-            self.skel.set_velocities(np.zeros(ndofs))
+            skel.set_velocities(np.zeros(ndofs))
             
         #perturb init state and statedot
-        qpos = self.skel.q + self.env.np_random.uniform(low= lPoseDel, high=poseDel, size=ndofs)
-        qvel = self.skel.dq + self.env.np_random.uniform(low= lPoseDel, high=poseDel, size=ndofs)
+        qpos = skel.q + rnd.uniform(low= lPoseDel, high=poseDel, size=ndofs)
+        qvel = skel.dq + rnd.uniform(low= lPoseDel, high=poseDel, size=ndofs)
         return qpos, qvel
 
     #returns a random observation, based on the full range of possible q and qdot, governed by joint limits and joint vel limits, if any exist
     def getRandomObservation(self):
+        rnd = self.env.np_random
         #get all known joint limits
         jtlims = self.getObsLimits()
         #print('{}'.format(jtlims))
-        rndQ = self.env.np_random.uniform(low=jtlims['lowQLims'],high=jtlims['highQLims'])
+        rndQ = rnd.uniform(low=jtlims['lowQLims'],high=jtlims['highQLims'])
 #        if not (np.isfinite(jtlims['lowDQLims']).all()) or not (np.isfinite(jtlims['highDQLims']).all()) :
 #            rndQDot = self.env.np_random.uniform(low=-self.qDotBnd, high= self.qDotBnd, size=self.ndofs)
 #        else :
-        rndQDot = self.env.np_random.uniform(low=jtlims['lowDQLims'],high=jtlims['highDQLims'])
+        rndQDot = rnd.uniform(low=jtlims['lowDQLims'],high=jtlims['highDQLims'])
         #build observation out of these state values and return this observation
         return self.getObsFromState(rndQ, rndQDot)
 
@@ -662,6 +671,27 @@ class skelHolder(ABC):
         #handle individual holder's pre-step code
         self._preStepIndiv(a)
         
+    #save all data necessary to restore current state
+    def _saveSimState(self):
+        skel=self.skel
+        self.saveStateForFwdBkwdStep = True
+        self.savedQ = skel.q
+        self.savedDq = skel.dq
+        self.savedDdq = skel.ddq
+        self.savedTau = np.copy(self.tau)
+
+    #restore all states to pre-step state
+    def _restoreSimState(self):
+        if self.saveStateForFwdBkwdStep :
+            skel=self.skel
+            skel.set_accelerations(self.savedDdq)          
+            skel.set_positions(self.savedQ)
+            skel.set_velocities(self.savedDq) 
+            self.tau = self.savedTau
+        else :
+            print("skelHldr_{}:_restoreSimState : Error - attempt to restore states that were not saved.".format(self.name))
+
+        self.saveStateForFwdBkwdStep = False
         
     #forward simulate only this skeleton, saving and restoring all moblity settings of all other skels
     def _stepNoneButMe(self):
@@ -743,7 +773,7 @@ class skelHolder(ABC):
         return obs, rwd, done, dbgDict
     
     #return skeleton qdot - maybe clipped, maybe not
-    def getSkelqDot(self):
+    def getClippedSkelqDot(self):
         return np.clip(self.skel.dq, -self.qDotBnd , self.qDotBnd )
     
     #base check goal functionality - this should be same for all agents,
@@ -840,24 +870,35 @@ class skelHolder(ABC):
         tau_cntct = np.zeros(self.ndofs)
         cntctDict = defaultdict(list)
         
-        for contact in contacts : 
-            if (self.skel.name != contact.bodynode1.skeleton.name ) and (self.skel.name != contact.bodynode2.skeleton.name ) :
-                #contact not from this skeleton
-                continue
-            bn = contact.bodynode1 if (self.skel.name == contact.bodynode1.skeleton.name) else contact.bodynode2
-            pt = bn.to_local(contact.point)
-            frc = contact.force
-            if (useLinJacob) :             
+        if (useLinJacob) :             
+            for contact in contacts : 
+                if (self.skel.name != contact.bodynode1.skeleton.name ) and (self.skel.name != contact.bodynode2.skeleton.name ) :
+                    #contact not from this skeleton
+                    continue
+                bn = contact.bodynode1 if (self.skel.name == contact.bodynode1.skeleton.name) else contact.bodynode2
+                pt = bn.to_local(contact.point)
+                frc = contact.force
                 JTrans = np.transpose(bn.linear_jacobian(offset=pt))           
-            else : 
+                tau_cntct += (JTrans.dot(frc))
+                cntctDict['bn'].append(bn)
+                cntctDict['pt'].append(pt)
+                cntctDict['frc'].append(frc)
+        else :        
+            for contact in contacts : 
+                if (self.skel.name != contact.bodynode1.skeleton.name ) and (self.skel.name != contact.bodynode2.skeleton.name ) :
+                    #contact not from this skeleton
+                    continue
+                bn = contact.bodynode1 if (self.skel.name == contact.bodynode1.skeleton.name) else contact.bodynode2
+                pt = bn.to_local(contact.point)
+                frc = contact.force
                 useForce = np.zeros(6)
                 useForce[3:]=contact.force
                 frc=useForce
                 JTrans = np.transpose(bn.world_jacobian(offset=pt))
-            tau_cntct += (JTrans.dot(frc))
-            cntctDict['bn'].append(bn)
-            cntctDict['pt'].append(pt)
-            cntctDict['frc'].append(frc)
+                tau_cntct += (JTrans.dot(frc))
+                cntctDict['bn'].append(bn)
+                cntctDict['pt'].append(pt)
+                cntctDict['frc'].append(frc)
             
         return tau_cntct,cntctDict
             
@@ -1689,7 +1730,7 @@ class ANASkelHolder(skelHolder):#, ABC):
         # tarLoc = self.cnstrntBody.to_world(x=self.cnstrntOnBallLoc)
         state =  np.concatenate([
             self.skel.q,
-            self.getSkelqDot(),
+            self.getClippedSkelqDot(),
             assistComp
             # #need location and force as part of observation!
             # tarLoc,
@@ -1740,9 +1781,10 @@ class ANASkelHolder(skelHolder):#, ABC):
             
             if (self.setReciprocal):
                 self.reachBody.add_ext_force(-1 * self.desExtFrcVal, _offset=self.reachBodyOffset)
-                
-    #calculate all force and torque components for current state of skel -TODO verify this
-    def _calFrcCmpsAtEefForTau(self, assist, tau, skel):
+
+    #build dictionary of all components of f=ma for current skeleton having been frwrd simmed with tau
+    def _calFrcCmpsAtEefForTau(self, tau, debug):
+        skel = self.skel
         M = skel.M
         #torques from mass, coriolis and gravity
         ma = M.dot(skel.accelerations())    
@@ -1750,9 +1792,7 @@ class ANASkelHolder(skelHolder):#, ABC):
         JtPullPInv_new, _, _, JDynInv = self.getEefJacobians(self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset, calcDynInv=True, M=M)        
         #get torques from contacts
         cntctTau, cntctDict = self.calcCntctTau(self.useLinJacob)
-        #get torque from assist force
-        #assistTorque = 
-        #build data vals
+        #build data vals ->cntctTau is external force
         tauArm = tau - ma - cg - cntctTau
         #tauDynArm = 
         frcDbg = []
@@ -1764,9 +1804,15 @@ class ANASkelHolder(skelHolder):#, ABC):
         frcDbg.append(tauArm)
         frcDbg.append(JDynInv.dot(tau))#force component at hand solely due to torque using dynamically consistent inv of J
         frcDbg.append(JDynInv.dot(tauArm))
-        lbl=['tau','ma','cg','cntct','JttauArm','armTorque', 'dyn_tau', 'dync_frc']
-        for i in range(len(lbl)) : 
-            print('{} : frc : {}\n'.format(lbl[i],frcDbg[i]))
+        if(debug):
+            lbl=['tau','ma','cg','cntct','JttauArm','armTorque', 'dyn_tau', 'dync_frc']
+            for i in range(len(lbl)) : 
+                print('{} : frc : {}'.format(lbl[i],frcDbg[i]))
+        return frcDbg, cntctTau, cntctDict
+                
+    #calculate all force and torque components for current state of skel -TODO verify this
+    def _calcCmpFrcAtEefForTau(self, assist, tau, debug):
+        frcDbg, cntctTau, cntctDict = self._calFrcCmpsAtEefForTau(tau, debug)
         
         eefPull=frcDbg[0][-3:] - frcDbg[1][-3:] - frcDbg[2][-3:] -frcDbg[3][-3:]
         #unit vector in assistance direction
@@ -1776,13 +1822,13 @@ class ANASkelHolder(skelHolder):#, ABC):
         eefPullOrtho = eefPull - eefPullTan
         orthoCompensateEefFrc = -eefPullOrtho
 
-        print('_calFrcCmpsAtEefForTau : w/applied assist : {} :\n\teefPull force : {} assist dir : {} assist Frc : {} eef in assist dir : {} ortho to assist : {} applied : {}'.format(assist, eefPull, assistDir, self.desExtFrcVal, eefPullTan, eefPullOrtho, orthoCompensateEefFrc))
+        print('_calcCmpFrcAtEefForTau : w/applied assist : {} :\n\teefPull force : {} assist dir : {} assist Frc : {} eef in assist dir : {} ortho to assist : {} applied : {}'.format(assist, eefPull, assistDir, self.desExtFrcVal, eefPullTan, eefPullOrtho, orthoCompensateEefFrc))
         eefPull = frcDbg[-1]
         eefPullTan =  eefPull.dot(assistDir) * assistDir
         eefPullOrtho = eefPull - eefPullTan
         orthoCompensateEefFrc = -eefPullOrtho
 
-        print('_calFrcCmpsAtEefForTau : w/dyn J applied assist : {} :\n\teefPull force : {} assist dir : {} assist Frc : {} eef in assist dir : {} ortho to assist : {} applied : {}'.format(assist, eefPull, assistDir, self.desExtFrcVal, eefPullTan, eefPullOrtho, orthoCompensateEefFrc))
+        print('_calcCmpFrcAtEefForTau : w/dyn J applied assist : {} :\n\teefPull force : {} assist dir : {} assist Frc : {} eef in assist dir : {} ortho to assist : {} applied : {}'.format(assist, eefPull, assistDir, self.desExtFrcVal, eefPullTan, eefPullOrtho, orthoCompensateEefFrc))
 
         res={}
         res['eefPull']=eefPull
@@ -1793,7 +1839,7 @@ class ANASkelHolder(skelHolder):#, ABC):
         return res
 
     #save sim state for this skel, step sim forward for this skel with current tau only, examine quantities and then restore previous sim state for this skel  
-    def _stepFrwrdStepBack(self, skel, tau, assist):        
+    def _stepFrwrdStepBackEefCompFrc(self, skel, tau, assist, debug):        
         #save ANA's current state
         q = skel.positions()
         dq = skel.velocities()
@@ -1801,9 +1847,9 @@ class ANASkelHolder(skelHolder):#, ABC):
         #apply control and step forward
         self.reachBody.set_ext_force(assist, _offset=self.reachBodyOffset)    
         skel.set_forces(tau)
-        self._stepNoneButMe()
+        self._stepNoneButMe() 
 
-        resDict = self._calFrcCmpsAtEefForTau(assist, tau, skel)
+        resDict = self._calcCmpFrcAtEefForTau(assist, tau, debug)
        
         #restore ANA's state
         skel.set_accelerations(ddq)          
@@ -1814,15 +1860,17 @@ class ANASkelHolder(skelHolder):#, ABC):
     
     #deterine ANA's eef force that is orthogonal to the assistance force
     #DEPRECATED
-    def _calcOrthoEefFrc(self, tau):
+    def _calcOrthoEefFrc(self, tau, debug=True):
         skel = self.skel
+        rb = self.reachBody
+        rbOff = self.reachBodyOffset
         #verified that undoing the simulation as I am doing is working
         #frwd sim ANA - first clear current ext force
         assist = np.array([0.0,0.0,0.0])
-        resDict = self._stepFrwrdStepBack(skel, tau, assist)
+        resDict = self._stepFrwrdStepBackEefCompFrc(skel, tau, assist, debug)
         #try with added assist force
         #assist=self.desExtFrcVal
-        resDict1 = self._stepFrwrdStepBack(skel, tau,assist)
+        #resDict1 = self._stepFrwrdStepBackEefCompFrc(skel, tau,assist)
              
 
         #below is for testing
@@ -2488,7 +2536,7 @@ class helperBotSkelHolder(skelHolder, ABC):
         #stateHuman has current force as part of observation, need to replace with local desired force TODO    
         state =  np.concatenate([
             self.skel.q,
-            self.getSkelqDot(),
+            self.getClippedSkelqDot(),
             stateHuman,
         ])            
         
@@ -2899,15 +2947,18 @@ class helperBotSkelHolder(skelHolder, ABC):
         self.mimicReachBody = self.mimicBot.body(self.reach_hand)
         #use self.reachBodyOffset to find actual location
 
-    #determine force necessary to frwrd sim ANA with given displacement
-    #then generate it
-    def frwrdSimBot_DispToFrc(self, a, desDisp, dbgFrwrdStep=False):
-        ulj = self.useLinJacob
-        ana = self.helpedSkelH
-        #get current cnstrntFrc on ANA
-        #extFrcAtEef, allCnstrntFrcAtEef, ttlCntctBdyFrcAtEef
-        anaEefPullFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef = ana.getExternalForceAtEef(ulj)
+    #use force ana sees at eef using proposed optimal action to derive assist force for bot 
+    def frwrdSimBot_DispToFrc(self, frcDbgDict, dbgFrwrdStep=False):
+        # ulj = self.useLinJacob
+        # ana = self.helpedSkelH
+        # anaSkel = ana.skel
+        # #get current cnstrntFrc on ANA
+        # #extFrcAtEef, allCnstrntFrcAtEef, ttlCntctBdyFrcAtEef
+        # anaEefPullFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef = ana.getExternalForceAtEef(ulj)
 
+
+        #use ANA's eef force here to derive control for bot using optimization - use secondary bot to derive control to generate eef force ANA sees
+        print("\n\n!!!!!!!!!!!!!!!!!!!!helperBotSkelHolder::frwrdSimBot_DispToFrc : Not Implemented!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n")
 
 
     #first use IK to find new pose for bot to enable desired displacement, then use SPD to move to this pose

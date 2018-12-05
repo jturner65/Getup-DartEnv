@@ -57,7 +57,7 @@ class followTraj(ABC):
                 self.dbgBuildMsg.append("Traj Is Kinematically evolved")
                 funcToUse = args['kinematicFunc']
         self.advFuncToUse = self.getFuncFromNameStr(funcToUse)
-        
+        self.dfltFuncToUseStr = funcToUse
         
         if (self.frame_skip == 1):
             self.coeffsFuncToUse = self.getFuncFromNameStr("setCoeffsSmoothAccel")
@@ -65,6 +65,7 @@ class followTraj(ABC):
             #coefficients to use to calculate spline trajectory for frameskips
             self.coeffsFuncToUse = self.getFuncFromNameStr(args['trajTargetFunc'])
             #method to derive v1 target velocity
+        self.coeffs = []
         self.v1FuncToUse = self.getFuncFromNameStr(args['accelManageFunc'])
         self.dbgBuildMsg.append("Set initVel : {} ".format(args['accelManageFunc']))
         self.dbgBuildMsg.append("Set Traj Coeffs : {} ".format(args['trajTargetFunc']))
@@ -128,6 +129,19 @@ class followTraj(ABC):
         else : 
             print("followTraj::getFuncFromNameStr : unknown advance function name : {}".format(name))
             return None
+
+    #this will save this trajectory's current state and set it to be active - 
+    # this is intended before test simstep to derive ana's eef frc
+    #this probably won't wont work with servo actuator
+    def saveAndSetActive(self):
+        self.saveCurVals()
+        self.advFuncToUse = self.getFuncFromNameStr(self.dfltFuncToUseStr)
+
+    #this will restore this trajectory's state and set it to be active
+    #this probably won't wont work with servo actuator
+    def restoreAndSetPassive(self):
+        self.restoreSavedVals()
+        self.advFuncToUse = self.getFuncFromNameStr("setBallNone")
 
     #retrieve debug messages set by this trajectory and clear list
     def getCurTrajDbgMsgs(self):
@@ -224,8 +238,10 @@ class followTraj(ABC):
         self.savedNextLoc = np.copy(self.nextLoc)
         self.savedNextDispLoc = np.copy(self.nextDispVec)
         self.savedOldLoc = np.copy(self.oldLoc)
+        self.savedNextFrameIncr = self.nextFrameIncr 
+        self.savedTrajIncr = self.trajIncr
         self.savedCoeffs = []
-        for coeff in self.splineCoeffs:
+        for coeff in self.coeffs:
             self.savedCoeffs.append(np.copy(coeff))
         self.savedTrajStep = self.trajStep
         
@@ -235,11 +251,14 @@ class followTraj(ABC):
         self.nextLoc = self.savedNextLoc
         self.nextDispVec = self.savedNextDispLoc
         self.curLoc = self.savedLoc
-        self.splineCoeffs = []
+        self.curDisp = self.savedCurDisp
+        self.coeffs = []
         for coeff in self.savedCoeffs:
-            self.splineCoeffs.append(np.copy(coeff))
+            self.coeffs.append(np.copy(coeff))
         self._setBallPosRaw(self.savedLoc,self.savedCurDisp)  #this will set curLoc and curDisp
         self.trajStep = self.savedTrajStep
+        self.nextFrameIncr = self.savedNextFrameIncr 
+        self.trajIncr = self.savedTrajIncr
 
     ########################################################################################
     # these are called at the beginning of every timestep.
@@ -493,6 +512,10 @@ class followTraj(ABC):
     @abstractmethod
     def incrTrajStepIndiv(self, perFrameIncr): pass
 
+    #used to force traj vals - only currently implemented for gauss traj
+    @abstractmethod
+    def setNewLocVals(self,vals):pass
+
     #return min and max bounds of displacement for a single iteration
     @abstractmethod
     def getMinMaxBnds(self): pass
@@ -660,6 +683,10 @@ class circleTraj(followTraj):
             ballPos = self.ballTrajCtr - ctrOffset
             print('Tracking Ball location in initTracking : {} | calc pos : {}\n'.format(self.trackObj.com(), ballPos))
 
+    def setNewLocVals(self,vals):
+        print("circleTraj::setNewLocVals : Not implemented")
+
+
     def calcNewPosIndiv(self, t):
         cts = np.cos(t)
         sts = np.sin(t) 
@@ -709,6 +736,9 @@ class linearTraj(followTraj):
     def calcNewPosIndiv(self, t):
         self.nextLoc = self.stLoc + (t * self.moveVec)
         self.nextDispVec = self.nextLoc - self.curLoc
+
+    def setNewLocVals(self,vals):
+        print("linearTraj::setNewLocVals : Not implemented")
 
 
     def incrTrajStepIndiv(self, perFrameIncr): 
@@ -846,26 +876,29 @@ class parabolicTraj(followTraj):
 
     #return min and max bounds of displacement for a single iteration
     def getMinMaxBnds(self): 
-        print('parabolicTraj.getMinMaxBnds : Not Implemented')
+        print('parabolicTraj::getMinMaxBnds : Not Implemented')
         res = [np.array([0,0,0]),np.array([self.trajIncr,self.trajIncr,self.trajIncr])]
         return res
 
     #return a random displacement in line with traj obj params
     def getRandDispVal(self):
-        print('parabolicTraj.getRandDispVal : Not Implemented')
+        print('parabolicTraj::getRandDispVal : Not Implemented')
         return self.nextLoc - self.curLoc
 
     #endloc is ignored
     def initTrajIndiv(self,endLoc):
 
-        print('parabolicTraj.initTrajPriv : Not Implemented')
+        print('parabolicTraj::initTrajPriv : Not Implemented')
 
     def calcNewPosIndiv(self, t): 
-        print('parabolicTraj.calcNewPosIndiv : Not Implemented')
+        print('parabolicTraj::calcNewPosIndiv : Not Implemented')
         self.nextDispVec = self.nextLoc - self.curLoc
 
+    def setNewLocVals(self,vals):
+        print("parabolicTraj::setNewLocVals : Not implemented")
+
     def incrTrajStepIndiv(self,perFrameIncr):
-        print('parabolicTraj.incrTrajStepIndiv : Not Implemented')      
+        print('parabolicTraj::incrTrajStepIndiv : Not Implemented')      
         #evolve trajstep
         self.trajStep += perFrameIncr
        
