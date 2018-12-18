@@ -59,8 +59,6 @@ class DartStandUp3dAssistEnv(assist2bot_env.DartAssist2Bot_Env, utils.EzPickle):
         #connect bot to constraint
         self.connectBot = False
         
-        #this environment uses force as an assistive component
-        self.assistIsFrcBased = True
         #whether or not to stop when trajectory is finished
         self.stopWhenTrajDone = False
         #display debug information regarding force application - turn off if training
@@ -78,7 +76,7 @@ class DartStandUp3dAssistEnv(assist2bot_env.DartAssist2Bot_Env, utils.EzPickle):
         #setBotDynamic : whether bot is set to be dynamically simulated or not (if not mobile is set to false)
         #botSolvingMethod is type of solving Bot should engage in : 0 is IK, 1 is constraint optimization dyn, 2 is IK-SPD 
         #spd gain is only used for IK_SPD solve 
-        botDict = defaultdict(int,{'setBotSolve':0, 'setBotDynamic':1, 'botSolvingMethod':0, 'SPDGain':10000000})
+        botDict = defaultdict(int,{'setBotSolve':0, 'setBotDynamic':1, 'botSolvingMethod':0, 'SPDGain':10000000,'frcBasedAssist':True})
         self.setTrainAndInitBotState(self.trainPolicy, botDict=botDict)                                
         utils.EzPickle.__init__(self)
  
@@ -412,7 +410,7 @@ class DartStandUp3dAssistEnv(assist2bot_env.DartAssist2Bot_Env, utils.EzPickle):
         else :
             frcMult = self.getMultFromFrc(frcComp)
         #make sure frcMult is within bounds
-        if not isValidAssist(frcMult) :
+        if not self.isValidAssist(frcMult) :
             return False, 'VAL OOB'
         #check location component if exists, to be within reasonable, reachable distance of ANA
         if (self.extAssistSize) > 3 :

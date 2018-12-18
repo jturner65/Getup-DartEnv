@@ -154,6 +154,8 @@ class DartEnv2Bot(gym.Env):
         #save and restore world state
         self.tot_SimState = []
         self.stateIsSaved = False
+        #whether pausing for user input should be allowed.  disable this during training
+        self.allowPauseForInput = False
         #set far-away center point for contact torque calculation to derive COP point from contacts with ground
         self.ctrTauPt = np.array([500,0,500])
 
@@ -346,6 +348,10 @@ class DartEnv2Bot(gym.Env):
         print('dart_env_2bot::getPoseVals : Unknown skeleton type, unable to set initial pose')
         return skel.q
             
+    #set assist objects' collide state
+    def setAssistObjsCollidable(self, doCollide):
+        self._setSkelCollidable(self.boxSkel,doCollide)
+        self._setSkelCollidable(self.skelHldrs[self.botIdx].skel, doCollide)
 
     #set which skeleton we are currently using for training/RL
     #also sets action and observation variables necessary for env to work
@@ -893,8 +899,9 @@ class DartEnv2Bot(gym.Env):
                 self._dispListOfText(ri, self.scrDispXYVals[idx], self.dispYOff[idx], self.scrDispClrList[idx], self.scrDispColTtl[idx], self.scrDispText[key], self.scrDispFont[idx])
                 idx +=1
 
-    #draw skeletons
+    #draw skeletons, with special colors being set for skeletons in list of tuples of skels and the render colors
     def renderSkels(self, ri):
+        #only renders skels in this list
         for skel in self.skelsToRndr : 
             skel.render()
         #skels with specific colors - doesn't work with urdf-loaded skels apparently
@@ -904,7 +911,6 @@ class DartEnv2Bot(gym.Env):
             ri.set_color(clr[0],clr[1],clr[2])
             skelTup[0].render_with_color(clr)
             ri.popState()
-
 
     def _dispListOfText(self, ri, stCoords, yOff, clr, hdrTxt, strList, font):
         if( len(strList) == 0) : return
@@ -1069,10 +1075,21 @@ class DartEnv2Bot(gym.Env):
 
     ###########################
     #externally called functions
-    #pause for a return, displaying the passed dispStr
-    def pauseForInput(self, dispStr):
-        print("Paused; Called from {} <hit enter>".format(dispStr), end=" ")
-        input()
+    #turn on/off ability to pause for input
+    def setAllowPauseForInput(self, val):
+        self.allowPauseForInput = val
+
+    #pause for a return, displaying the passed dispStr, if allowPause enabled
+    #valsToDips is list of values to display when paused
+    def pauseForInput(self, dispStr, waitOnInput=True, valsToDisp=[]):
+        if (not self.allowPauseForInput):return
+        print("Called from {} ".format(dispStr))
+        numVals = len(valsToDisp)
+        for i in range(numVals):
+            print("\t{} : {}".format(i, valsToDisp[i]))
+        print("Paused; <hit enter to continue>", end=" ")
+        if(waitOnInput):
+            input()
     
     #return a string name to use as a directory name for a simulation run
     def getRunDirName(self):

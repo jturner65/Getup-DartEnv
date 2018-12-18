@@ -41,8 +41,10 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
         self.connectBot = False
 
         #solve bot dynamic tracking using IK-SPD - this loads copy of bot arm to use as IK template
-        self.solveBotIK_SPD = False
-        #solve via assistance
+        self.enableMimicBot = False
+        #whether mimic is kinematic or dynamic
+        self.mimicIsDynamic = False
+        #solve via assistance - bypass generic step
         self.stepBotAssist = True
 
         #whether or not to stop when trajectory is finished
@@ -197,7 +199,12 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
         #no assist force for this skel, so no need to set this
         self.skelHldrs[self.humanIdx].setAssistFrcEveryTauApply = False
         #baseline does not solve for IK/SPD
-        self.solveBotIK_SPD = False
+        self.enableMimicBot = False
+        self.mimicIsDynamic = False
+        #debug trajectory
+        self.trackTraj.debug = True
+        #whether this environment uses force as an assistive component in the observation, or something else, such as displacement
+        self.assistIsFrcBased = botDict['frcBasedAssist']
 
         if (_train):
             # #set to false to enable robot to help, otherwise, set to true if training and applying specific force to robot
@@ -215,48 +222,74 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
             #turn off all debug displays during training          
             for _,hndlr in self.skelHldrs.items():
                 hndlr.debug=False      
+            #debug trajectory never during training
+            self.trackTraj.debug = False
+            #never allow pausing for input during training
+            self.allowPauseForInput = False
 
         else : 
+            isDynamic = botDict['setBotDynamic'] != 0# whether actual bot is dynamic or kinematic
             _botSolvingMethod = botDict['botSolvingMethod']
             #_dynamicBot bot is fwd simulated - set mobile if true, if immobile (false) either does nothing or solves IK
             if(_botSolvingMethod == 0) :  #IK to position
                 isDynamic = False
-            elif(_botSolvingMethod == 1) :    #optimization torque derivation to position
-                isDynamic = botDict['setBotDynamic'] != 0#_solvingBot
+            elif(_botSolvingMethod == 1) :    #optimization torque derivation to position and assist force
+                pass
             elif(_botSolvingMethod == 2) :    #IK to find pose; SPD to find torques, to render position/displacement
-                isDynamic = botDict['setBotDynamic'] != 0#__solvingBot
                 #if solving bot control via IK/SPD, setup initial matricies
-                self.setSolveBotIK_SPD(self.solvingBot,botDict['SPDGain'])
+                self.setMimicBotConfig(self.solvingBot,False,botDict['SPDGain'])
+            elif(_botSolvingMethod == 3) :    #mimic will derive desired forces to be applied to bot
+                #if solving bot control via IK/SPD, setup initial matricies
+                self.setMimicBotConfig(self.solvingBot,True,botDict['SPDGain'])
 
             self.skelHldrs[self.botIdx].setSkelMobile(isDynamic)       
 
-            # #if not training : 
-            # if (_helpingBot):
-            #     #do not apply force to human if robot is actively helping - force should be sent to robot via simulation
-            #     self.skelHldrs[self.humanIdx].setAssistFrcEveryTauApply = False
-            #     pass
-            # else :
-            #     #force to apply assist every step - demonstrating force without policy
-            #     #not training, bot is solving but not helping - if helping then needs to be constrained to human to exert force
-            #     if(not _train):# and _solvingBot):
-            #         self.skelHldrs[self.humanIdx].setAssistFrcEveryTauApply = True    
-
-        self.trackTraj.debug = True
         self.constraintsBuilt = False
         #set human and helper bot starting poses - these are just rough estimates of initial poses - poses will be changed every reset
         self.skelHldrs[self.humanIdx].setToInitPose()
         #set states and constraints - true means set robot init pose, so that it can IK to eef pos
         self._resetEefLocsAndCnstrnts(True)
+        #add mimic bot used to IK or derive control force - set in setTrainAndInitBotState
+        if (self.enableMimicBot):
+            self.initMimicBot(isDynamic=self.mimicIsDynamic) 
+        
+    #set the alt bot body node clrs to be different; also adds to list to be rendered.  skeleton sent to this function should not be 
+    def setRenderWithColorOfSkel(self, skel, clr):
+        #from dart_env_2bot.py : list of tuples of skels to render (idx0) with color list (idx1)
+        #self.skelsToRndrWClr= []
+        skelTup = (skel,clr)
+        self.skelsToRndrWClr.append(skelTup)
+
+    #set up mimic bot - duplicate of helper bot to be used to IK to positions without breaking constraints
+    #if isDynamic is false (IK_SPD solve), then only used to solve IK; if true then used to synthesize control for desired force
+    def initMimicBot(self, isDynamic=False):
+        if (self.helperBotFullPath is None): return
+        self.dart_world.add_skeleton(self.helperBotFullPath)
+        #mimic skel is last skel added in most recent add_skeleton pass
+        mimicSkel = self.dart_world.skeletons[-1]
+        mimicSkel.setName("mimicBot")
+        #change colors - doesnt work due to meshes used to render bot, necessary to add to extra render loop
+        self.setRenderWithColorOfSkel(mimicSkel,[1.0,0.0,0.0,0.5])
+        #turn off collisions 
+        self._setSkelNoCollide(mimicSkel, mimicSkel.name)
+        #turn off mobile if not dynamic so no frwd sim executed
+        mimicSkel.set_mobile(isDynamic)
+        self.skelHldrs[self.botIdx].setMimicBot(_mimicSkel=mimicSkel)
 
     #call this to configure assist bot to solve IK to find desired pose and then use SPD to generate torques to meet that pose
-    def setSolveBotIK_SPD(self, doSolve, SPDGain):
+    #if mimicIsDyn then use mimic to derive force, otw use mimic to IK to displacement and then SPD to derive control for delta q
+    def setMimicBotConfig(self, doSolve, mimicIsDyn, SPDGain):
         #set this so that mirror arm is loaded
-        self.solveBotIK_SPD = True
+        self.enableMimicBot = True
+        #whether or not mimic is kinematic (IK + SPD) or dynamic
+        self.mimicIsDynamic = mimicIsDyn
         #if actually solving 
         if (doSolve):
             self.skelHldrs[self.botIdx].buildSPDMats(SPDGain)
-            #bot is helping - this calls alternate step function
+            #actual bot is helping - this calls alternate step function
             self.stepBotAssist = True
+            #which assist func to use
+
     
     ############################################################
     # Sim Step-related functions

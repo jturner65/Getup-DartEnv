@@ -98,14 +98,13 @@ class skelHolder(ABC):
         #whether states have been saved for restore after frwrd step
         self.saveStateForFwdBkwdStep = False
 
-
-
         #display debug information for this skel holder
         self.debug = True
 
         #set baseline desired external forces and force mults
         self.desExtFrcVal = np.array([0,0,0])
         self.desExtFrcDir = np.array([0,0,0])
+        self.useForce = self.setUseLinJacobian(self.useLinJacob)
    
         #initial torques - set to tau to be 0
         self.dbgResetTau()
@@ -138,7 +137,10 @@ class skelHolder(ABC):
         self.kneeDOFIdxs= []
         self.kneeDOFActIdxs=[]
 
-
+        #this is mimic skeleton used to perform calculations without needing to break constraints on actual ANA/bot.  
+        # set in simulation via skelHldr.setMimicBot(<skeleton>)
+        self.mimicBot = None 
+        self.mimicReachBody = None
 
     #if using SPD to provide control to this holder's skel, call this function on init
     def buildSPDMats(self, SPDGain):
@@ -206,7 +208,12 @@ class skelHolder(ABC):
         #self.buildStateCDF = False#set this true in ana if wanted   
         self.numStatesToPoll = 25 # max number of best states to poll for starting state proposals        
         self.stateRwdSorted = SortedDict()#holds all states with their rewards as keys - hopefully no collisions with floats as keys     
-        
+
+    #set this skel holder's mimic/dupe bot, for IK or other calculations decoupled from simulation
+    def setMimicBot(self, _mimicSkel):
+        self.mimicBot = _mimicSkel
+        self.mimicReachBody = self.mimicBot.body(self.reach_hand)
+        #use self.reachBodyOffset to find actual location
 
     #moved from dart_env_2bot - this sets up the action and (initial) observation spaces for the skeleton.  
     # NOTE : the observation space does not initially include any external forces, and can be modified through external calls to setObsDim directly
@@ -271,6 +278,12 @@ class skelHolder(ABC):
         self.skel.set_mobile(val)
         #frwrdSim is boolean whether mobile/simulated or not
         self.isFrwrdSim = val
+
+    #whether or not to use linear jacobian or world jacobian
+    def setUseLinJacobian(self, val):
+        self.useLinJacob = val
+        #update the use force vector to match appropraite dimensions
+        self.useForce = self.setUseFrc(val,self.desExtFrcVal)
            
     #initialize constraint/target locations and references to constraint bodies
     def initConstraintLocs(self,  cPosInWorld, cBody):
@@ -306,6 +319,14 @@ class skelHolder(ABC):
     def getWorldPosCnstrntToFinger(self):
         return self.cnstrntBody.to_world(x=self.cnstrntOnBallLoc) - self.reachBody.to_world(x=self.reachBodyOffset)
 
+    #set mimic bot to be identical q/dq to main skel(passed as arg); return mimic bot eef loc
+    def setMimicSkelStateToBaseSkel(self, skel):
+        #initialize mimic skeleton to perform IK - first mimic current pose and vel of helper bot        
+        self.mimicBot.set_positions(skel.q)
+        self.mimicBot.set_velocities(skel.dq)
+        mimicBotEefPos = self.mimicReachBody.to_world(x=self.reachBodyOffset)
+        return mimicBotEefPos
+
     #set the desired external force for this skel
     #(either the force applied to the human, or the force being applied by the robot)
     #set reciprocal is only used for debugging/displaying efficacy of force generation method for robot
@@ -314,6 +335,7 @@ class skelHolder(ABC):
         #self.lenFrcVec = len(desFrcTrqVal)
         self.desExtFrcVal = np.copy(desFrcTrqVal)
         self.desExtFrcDir =  np.copy(desExtFrcVal_dir)
+        self.useForce = self.setUseLinJacobian(self.useLinJacob)
         #if true then apply reciprocal force to reach body
         self.setReciprocal = setReciprocal
 #        if(setReciprocal):
@@ -1089,8 +1111,40 @@ class skelHolder(ABC):
         worldEefCnstrntFrc = JTransInv.dot(self.skel.constraint_forces())
         return worldEefCnstrntFrc
 
-    #this will calculate external force as seen at eef, not counting contributions from contact with ground
+    #this will calculate external force as seen at eef, not counting contributions from contact with ground or internal forces
     def getExternalForceAtEef(self, useLinJacob):
+        #        #jacobian to end effector 
+        JTransInv, JTrans, Jpull, _ = self.getEefJacobians(useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
+        #convert constraint force as seen at dofs to world force seen at eef
+        cnstFrc = self.skel.constraint_forces()
+        #now determine contributions from contact with ground
+        ttlCntctBdyTrque = self.getTtlCntctBdyTrque()
+        #subtract cntct frc @ eef from ttl cnstrnt force @ eef to get external force due to assist
+        #add due to sign of contact forces? different collision detectors seem to have different signs/directions for the contacts they return, either grf or actual force exerted
+        extFrcAtEef = JTransInv.dot(cnstFrc + ttlCntctBdyTrque)
+
+        return extFrcAtEef
+
+    #get total contact induced body torques
+    def getTtlCntctBdyTrque(self):
+         #get current contact info - dict of per-body contacts
+        cntctInfo = self.getMyContactInfo()
+        #use bdy.calcTtlBdyTrqs() to get total body torque from contacts 
+        ttlCntctBdyTrque = np.zeros(np.size(self.skel.q,axis=0))
+        for k,v in cntctInfo.items():
+            ttlCntctBdyTrque += v.calcTtlBdyTrqs()
+        return ttlCntctBdyTrque
+    
+    #get total contact-induced forces @ eef - only used for debugging
+    def getTtlCntctEefFrcs(self, useLinJacob):
+        JTransInv, JTrans, Jpull, _ = self.getEefJacobians(useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
+        ttlCntctBdyTrque = self.getTtlCntctBdyTrque()
+        ttlCntctBdyFrcAtEef = JTransInv.dot(ttlCntctBdyTrque)
+        return ttlCntctBdyFrcAtEef
+
+    #debug version - slower with multiple jacobian calcs 
+    # this will calculate external force as seen at eef, not counting contributions from contact with ground or internal forces
+    def getExternalForceAtEef_DBG(self, useLinJacob):
         #        #jacobian to end effector 
         JTransInv, JTrans, Jpull, _ = self.getEefJacobians(useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
         #convert constraint force as seen at dofs to world force seen at eef
@@ -1098,58 +1152,81 @@ class skelHolder(ABC):
         #convert constraint force as seen at dofs to world force seen at eef
         allCnstrntFrcAtEef = JTransInv.dot(cnstFrc)
         #now determine contributions from contact with ground
-        #get current contact info - dict of per-body contacts
-        cntctInfo = self.getMyContactInfo()
-        #use bdy.calcTtlBdyTrqs() to get total body torque from contacts 
-        ttlCntctBdyTrque = np.zeros(np.size(self.skel.q,axis=0))
-        for k,v in cntctInfo.items():
-            ttlCntctBdyTrque += v.calcTtlBdyTrqs()
+        ttlCntctBdyTrque = self.getTtlCntctBdyTrque()
         ttlCntctBdyFrcAtEef = JTransInv.dot(ttlCntctBdyTrque)
         #subtract cntct frc @ eef from ttl cnstrnt force @ eef to get external force due to assist
         #add due to sign of contact forces? different collision detectors seem to have different signs/directions for the contacts they return
         extFrcAtEef = allCnstrntFrcAtEef + ttlCntctBdyFrcAtEef
 
         return extFrcAtEef, allCnstrntFrcAtEef, ttlCntctBdyFrcAtEef
+
+    def setUseFrc(self, useLinJacob, desFrc):
+        if (useLinJacob) :             
+            useForce = np.copy(desFrc)
+        else : 
+            #wrench TODO verify target orientation should be 0,0,0
+            useForce = np.zeros(6)
+            useForce[3:]=desFrc
+        return useForce
     
     #return body torques to provide self.desExtFrcVal at toWorld(self.constraintLoc)
     #provides JtransFpull component of equation
     def getPullTau(self, useLinJacob, debug=False):  
         JTransInv, JTrans, Jpull, _ = self.getEefJacobians(useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
-        if (useLinJacob) :             
-            self.useForce = self.desExtFrcVal
-        else : 
-            #wrench TODO verify target orientation should be 0,0,0
-            self.useForce = np.zeros(6)
-            self.useForce[3:]=self.desExtFrcVal
+        self.useForce = self.setUseFrc(useLinJacob,self.desExtFrcVal)
         if(debug):
             print('getPullTau : pull force being used : {} '.format(self.useForce))
             
         resTau = JTrans.dot(self.useForce)
         #last 3 rows as lin component
         return resTau, JTransInv, Jpull, Jpull[-3:,:]
+
     
-    #build force dictionary to be used to verify pull force after sim step 
+    #build force dictionary to be used to verify pull force after sim step for so
     #rwd is reward generated for the motion of this step of sim
     #indivCalcFlag : passed to child class impelementation
-    def _buildPostStepFrcDict(self, calcTauMag=True, indivCalcFlag=True):
-        skel = self.skel
+    def _buildPostStepFrcDictForPassedSkel(self, skel, useLinJacob, body, offset):
         ma = skel.M.dot(skel.ddq )    
         cg = skel.coriolis_and_gravity_forces() 
         #torque cntrol desired to provide pulling force at contact location on reaching hand    
-        JtPullPInv_new, _, _, _ = self.getEefJacobians(self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
+        JtPullPInv_new, _, _, _ = self.getEefJacobians(useLinJacob, body=body, offset=offset)
         
         frcD = {}      
-        t=self.tau
-        frcD['tau']=np.copy(t)
-        if calcTauMag :
-            frcD['tauMag']= np.sqrt(t.dot(t))
         frcD['ma']=ma
         frcD['cg']=cg
         #jacobian pemrose inverse to pull contact point
         frcD['JtPullPInv_new'] = JtPullPInv_new        
         frcD['jtDotCGrav'] = JtPullPInv_new.dot(cg)
         frcD['jtDotMA'] = JtPullPInv_new.dot(ma)
+              
+        return frcD, JtPullPInv_new
+  
+    #build force dictionary to be used to verify pull force after sim step 
+    #rwd is reward generated for the motion of this step of sim
+    #indivCalcFlag : passed to child class impelementation
+    def _buildPostStepFrcDict(self, calcTauMag=True, indivCalcFlag=True):
+        skel = self.skel
+        frcD, JtPullPInv_new= self._buildPostStepFrcDictForPassedSkel(skel, self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
+        t=self.tau
+        frcD['tau']=np.copy(t)
         frcD['jtDotTau'] = JtPullPInv_new.dot(t)
+        # ma = skel.M.dot(skel.ddq )    
+        # cg = skel.coriolis_and_gravity_forces() 
+        # #torque cntrol desired to provide pulling force at contact location on reaching hand    
+        # JtPullPInv_new, _, _, _ = self.getEefJacobians(self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
+        
+        # frcD = {}      
+        # t=self.tau
+        # frcD['tau']=np.copy(t)
+        # if calcTauMag :
+        #     frcD['tauMag']= np.sqrt(t.dot(t))
+        # frcD['ma']=ma
+        # frcD['cg']=cg
+        # #jacobian pemrose inverse to pull contact point
+        # frcD['JtPullPInv_new'] = JtPullPInv_new        
+        # frcD['jtDotCGrav'] = JtPullPInv_new.dot(cg)
+        # frcD['jtDotMA'] = JtPullPInv_new.dot(ma)
+        # frcD['jtDotTau'] = JtPullPInv_new.dot(t)
         
         #handle individual skel's frc components that may affect calculation of totPullFrc, 
         #also calculate totPullFrc appropriately for this skel (might include constraint force or not)       
@@ -1235,6 +1312,28 @@ class skelHolder(ABC):
     ######################################################
     #   debug, testing and helper functions
     ######################################################
+
+    #build debug info for all measurable components of F=MA @ eef
+    def dbgCalcAllEefFrcComps(self, _name):
+        frcDict = self._buildPostStepFrcDict(calcTauMag=False, indivCalcFlag=False)
+        resList = []
+        for k,v in frcDict.items():
+            if ("jt" not in k.lower()) or ("_new" in k.lower()):
+                continue
+            resList.append('{} {} : \t{}'.format(_name, k,v))
+        return resList,frcDict
+
+    #same as above but calculating for non-skel-holder-owned skel
+    def dbgCalcAllEefFrcCompsForPassedSkel(self, _skel, _name,  _useLinJacob, _body, _offset):
+        frcDict, JtPullPInv = self._buildPostStepFrcDictForPassedSkel(_skel, _useLinJacob, _body, _offset)
+        resList = []
+        for k,v in frcDict.items():
+            if ("jt" not in k.lower()) or ("_new" in k.lower()):
+                continue
+            resList.append('{} {} : \t{}'.format(_name, k,v))
+        return resList,frcDict, JtPullPInv
+
+
     
     #display results of fwd simulation - force generated at end effector
     def dispFrcEefRes(self, dispDetail):    
@@ -1537,8 +1636,8 @@ class ANASkelHolder(skelHolder):#, ABC):
         # #whether or not to use CDF of all previously seen states in CDF to determine initial state - only this or checkBestState should ever be set to true, never both
         # self.buildStateCDF = False  
 
-        #use 3dim jacobians for frc calcs
-        self.useLinJacob = True
+        #use 3dim jacobians for frc calcs and build initial useForce of appropriate dims
+        self.useForce = self.setUseLinJacobian(True)
         
         #sqrt of numActuated dofs, for action reward scaling
         self.sqrtNumActDofs = np.sqrt(self.numActDofs)
@@ -1782,37 +1881,61 @@ class ANASkelHolder(skelHolder):#, ABC):
             if (self.setReciprocal):
                 self.reachBody.add_ext_force(-1 * self.desExtFrcVal, _offset=self.reachBodyOffset)
 
+    #calculate frc at eef
+    def _calFrcAtEef(self):
+        ulj =self.useLinJacob
+        eefFrc = self.getExternalForceAtEef(ulj)
+        return eefFrc
+
     #build dictionary of all components of f=ma for current skeleton having been frwrd simmed with tau
-    def _calFrcCmpsAtEefForTau(self, tau, debug):
+    def _calFrcCmpsAtEefForTau(self, tau, useDynJ, debug):
         skel = self.skel
         M = skel.M
         #torques from mass, coriolis and gravity
         ma = M.dot(skel.accelerations())    
         cg = skel.coriolis_and_gravity_forces()  
-        JtPullPInv_new, _, _, JDynInv = self.getEefJacobians(self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset, calcDynInv=True, M=M)        
+        JtPullPInv_new, _, _, JDynInv = self.getEefJacobians(self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset, calcDynInv=useDynJ, M=M)        
+        #JtPullPInv_new, _, _, _ = self.getEefJacobians(self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)    
         #get torques from contacts
         cntctTau, cntctDict = self.calcCntctTau(self.useLinJacob)
+        #constraint forces
+        cnstrntFrc = skel.constraint_forces()
         #build data vals ->cntctTau is external force
-        tauArm = tau - ma - cg - cntctTau
-        #tauDynArm = 
+        # tauArm0 = tau - ma - cg + cnstrntFrc + cntctTau   
+        # tauArm1 = tau - ma - cg + cnstrntFrc - cntctTau
+        # tauArmCnstrntFrcOnly = cnstrntFrc + cntctTau   #this looks most appropriate (since contacts are forces applied to skeleton, taus will also be applied to skeleton, as opposed to originating in skeleton)
+        # cBdyFrc = self.cnstrntBody.skeleton.constraint_forces()
+        # cMaCgFrc = - ma - cg + cnstrntFrc
+        # print("\teefFrc0 = jtInv(tau - ma - cg + cnstrntFrc + cntctTau) :  {} |\n\teefFrc1 = jtInv(tau - ma - cg + cnstrntFrc - cntctTau) : {}".format(JtPullPInv_new.dot(tauArm0),JtPullPInv_new.dot(tauArm1)))
+        # print("\tauArmCnstrntFrcOnly = jtInv(cnstrntFrc - cntctTau) : {}\n\t cBodyFrc : {}\n\t cMaCgFrc=cnstrnt-ma-cg: {} ".format(JtPullPInv_new.dot(tauArmCnstrntFrcOnly),cBdyFrc,JtPullPInv_new.dot(cMaCgFrc)))
+        tauArm=tau - ma - cg + cnstrntFrc + cntctTau
+
+        eefFrc = JtPullPInv_new.dot(cnstrntFrc + cntctTau)
+
         frcDbg = []
         frcDbg.append(JtPullPInv_new.dot(tau))#force component at hand solely due to torque
         frcDbg.append(JtPullPInv_new.dot(ma))#force component at hand due to ma
         frcDbg.append(JtPullPInv_new.dot(cg))#force component at hand due to coriolis and gravity
         frcDbg.append(JtPullPInv_new.dot(cntctTau))#force component at hand due to ground collisions reactive forces
+        frcDbg.append(JtPullPInv_new.dot(cnstrntFrc))#force component at hand due to ground collisions reactive forces        
         frcDbg.append(JtPullPInv_new.dot(tauArm))
-        frcDbg.append(tauArm)
-        frcDbg.append(JDynInv.dot(tau))#force component at hand solely due to torque using dynamically consistent inv of J
-        frcDbg.append(JDynInv.dot(tauArm))
+        # frcDbg.append(tauArm)
+        if useDynJ :
+            frcDbg.append(JDynInv.dot(tau))#force component at hand solely due to torque using dynamically consistent inv of J
+            frcDbg.append(JDynInv.dot(tauArm))
         if(debug):
-            lbl=['tau','ma','cg','cntct','JttauArm','armTorque', 'dyn_tau', 'dync_frc']
+            lbl=['tau','ma','cg','cntctEEF','cnstraintEEF','JttauArm']
+            if useDynJ :
+                lbl.append('DynInvTauAtEef')
+                lbl.append('DynInvTauAtEef')
+            print('_calFrcCmpsAtEefForTau : vals at eef : ')
             for i in range(len(lbl)) : 
                 print('{} : frc : {}'.format(lbl[i],frcDbg[i]))
-        return frcDbg, cntctTau, cntctDict
+        return eefFrc, frcDbg, cntctTau, cntctDict
                 
     #calculate all force and torque components for current state of skel -TODO verify this
     def _calcCmpFrcAtEefForTau(self, assist, tau, debug):
-        frcDbg, cntctTau, cntctDict = self._calFrcCmpsAtEefForTau(tau, debug)
+        eefFrc, frcDbg, cntctTau, cntctDict = self._calFrcCmpsAtEefForTau(tau, True, debug)
         
         eefPull=frcDbg[0][-3:] - frcDbg[1][-3:] - frcDbg[2][-3:] -frcDbg[3][-3:]
         #unit vector in assistance direction
@@ -2369,22 +2492,6 @@ class ANASkelHolder(skelHolder):#, ABC):
         #print ('reward : {}\tdone :{}'.format(reward, done))
         return rwdComps['reward'], done, dbgStructs     
     
-    #calc end effector force
-    def tmpCalcEEF_Frc(self):
-        skel = self.skel
-        ma = skel.M.dot(skel.ddq )    
-        cg = skel.coriolis_and_gravity_forces() 
-        cnstrntF = skel.constraint_forces()
-        #torque cntrol desired to provide pulling force at contact location on reaching hand    
-        JtPullPInv_new, _, _, _ = self.getEefJacobians(self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
-        
-        frcD = {}      
-        t=self.tau        
-        totEEfTau = ma + cg + cnstrntF - t
-        totEEfFrc = JtPullPInv_new.dot(totEEfTau)             
-        
-        return totEEfFrc    
-    
     #based upon which reward functions are being used, aggregate per-sim step (frameskip) quantities, so they can each be considered in reward function calculation
     def aggregatePerSimStepRWDQuantities(self, debug):
         #if contacts, aggregate contact profile
@@ -2393,8 +2500,7 @@ class ANASkelHolder(skelHolder):#, ABC):
             self.RWDContactDicts.append(contactDict)
         #if assistFrcPen, aggregate all constraint forces from each sim frame
         if (self.rwdsToCheck['assistFrcPen']):
-            cFrc = self.cnstrntBody.skeleton.constraint_forces()            
-            #meCFrc = self.tmpCalcEEF_Frc()
+            cFrc = self.cnstrntBody.skeleton.constraint_forces()    
             cFrcMod = np.array(cFrc)
             #subtract assist force from constraint force (meaning we don't penalize desired assist force) - this is 0 unless we are using frc as a component of observation
             #compensate for mg from constraint force -> find force only used to "satisfy constraint" -> pulling force
@@ -2459,8 +2565,11 @@ class helperBotSkelHolder(skelHolder, ABC):
         #limit for qdot proposals only if box constraints are set to true
         self.qdotLim = 5.0   
         #set in child classes
-        self.bndCnst = -1             
-        
+        self.bndCnst = -1      
+
+        #use 3dim jacobians for frc calcs and build initial useForce of appropriate dims
+        self.useForce = self.setUseLinJacobian(True)
+       
         ########################
         ##  runtime flags
         #do not use randomized initial state - use init state that has been evolved & IKed to be in contact with constraint
@@ -2480,9 +2589,6 @@ class helperBotSkelHolder(skelHolder, ABC):
         self.useForce = np.zeros(numDim)
         #sets dimension of optimization vector : function lives in child class
         self.nOptDims = self.getNumOptDims()
-        #this is mimic skeleton used to perform calculations without needing to break constraints on actual bot.  
-        # set in simulation
-        self.mimicBot = None 
         #old dq, to calculate ddq
         self.oldDq = np.zeros(self.ndofs)
       
@@ -2506,7 +2612,6 @@ class helperBotSkelHolder(skelHolder, ABC):
     #return any exta components beyond SAS' to be saved in SAS' csv file
     def _SASVecGetHdrNamesPriv(self): 
         return 'reward'
-
     
     #helper bot will IK to appropriate world position here, and reset init pose    
     def _setToInitPosePriv(self):
@@ -2564,7 +2669,8 @@ class helperBotSkelHolder(skelHolder, ABC):
 
         #for derivs for accel term and tau
         self.dofOnes = np.ones(self.ndofs)
-        
+        #pre-calc for per-step derivations
+        self.oneAOvTS = self.dofOnes/self.perSimStep_dt
         #negative because subttracted Tau in MA equality constraint
         self.tauDot = self.dofOnes * -1
         self.tauDot[0:self.stTauIdx] *=0
@@ -2733,7 +2839,7 @@ class helperBotSkelHolder(skelHolder, ABC):
         
     
     #called from prestep, set important values used to track trajectory ball and retain original state info before step
-    def setPerStepStateVals(self, calcDynQuants):        
+    def setPerStepStateVals(self, calcDynQuants):
         #tracking body curent location and last location, for vel vector
         self.trackBodyLastPos = self.trackBodyCurPos
         #world position of tracked position on ball
@@ -2822,7 +2928,6 @@ class helperBotSkelHolder(skelHolder, ABC):
         
         desTorques = self.M.dot(res1 + res2) - Kd_dq + Kd_JinvKp_e + self.CfG + self.Tau_JtFpull        
         return desTorques      
-
     
     #keep around last step's decision variable
     def setPrevCurrGuess(self, x):
@@ -2831,7 +2936,7 @@ class helperBotSkelHolder(skelHolder, ABC):
     
     #initialize these values every time step - as per Abe' paper they are constant per timestep
     def setSimVals(self):        
-        self.oneAOvTS = self.dofOnes/self.perSimStep_dt
+        #self.oneAOvTS = self.dofOnes/self.perSimStep_dt
         #per timestep constraint and eef locations and various essential jacobians
         self.setPerStepStateVals(True)
         #Mass Matrix == self.skel.M
@@ -2877,7 +2982,7 @@ class helperBotSkelHolder(skelHolder, ABC):
             print('helperBotSkelHolder::preStepKin : {} robot set to not mobile, so no optimization being executed, but IK to constraint position performed'.format(self.skel.name))
         self.setPerStepStateVals(False)
         self.IKtoCnstrntLoc()
-       
+
         
     #pre-sim step for dynamic simulation - initialize and solve optimal control
     def preStepDyn(self):
@@ -2941,24 +3046,38 @@ class helperBotSkelHolder(skelHolder, ABC):
         else :                      #dynamic, and prestep called, means we want to solve opt control
             self.preStepDyn()       
 
-    #set up mimic bot for IK calculation
-    def setMimicBot(self, _mimicSkel):
-        self.mimicBot = _mimicSkel
-        self.mimicReachBody = self.mimicBot.body(self.reach_hand)
-        #use self.reachBodyOffset to find actual location
-
     #use force ana sees at eef using proposed optimal action to derive assist force for bot 
-    def frwrdSimBot_DispToFrc(self, frcDbgDict, dbgFrwrdStep=False):
-        # ulj = self.useLinJacob
-        # ana = self.helpedSkelH
-        # anaSkel = ana.skel
-        # #get current cnstrntFrc on ANA
-        # #extFrcAtEef, allCnstrntFrcAtEef, ttlCntctBdyFrcAtEef
-        # anaEefPullFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef = ana.getExternalForceAtEef(ulj)
-
-
+    def frwrdSimBot_DispToFrc(self, desFrc, dbgFrwrdStep=False):
         #use ANA's eef force here to derive control for bot using optimization - use secondary bot to derive control to generate eef force ANA sees
-        print("\n\n!!!!!!!!!!!!!!!!!!!!helperBotSkelHolder::frwrdSimBot_DispToFrc : Not Implemented!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n")
+        #print("\n\n!!!!!!!!!!!!!!!!!!!!helperBotSkelHolder::frwrdSimBot_DispToFrc : Not Implemented - Use Mimic Bot to derive control force : {}!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n".format(desFrc))
+        #skel = self.skel
+        #initialize mimic skeleton to perform IK - first mimic current pose and vel of helper bot        
+        #mimicBotEefPos = self.setMimicSkelStateToBaseSkel(skel)
+        #desFrc is desired target optimization force - this is determined by the forward step of ANA with optimal dist
+
+        #f_hat, botResFrcDict = self.skelHldrs[self.botIdx].frwrdStepBotForFrcVal(eefFrc, recip=True, restoreBotSt=restoreBotSt, dbgFrwrdStep=False) 
+        #turn off bot debugging, will still display overall force generated
+        self.debug=False        
+        #find dir of force
+        norm=np.linalg.norm(desFrc)
+        if (norm == 0) :
+            desFrcDir = np.array([0,0,0]) 
+        else : 
+            desFrcDir = (desFrc / norm)
+            
+        #init and solve for bot optimal control for current target force
+        self.setDesiredExtAssist(desFrc, desFrcDir, setReciprocal=True) 
+        #initialize & solve - always dynamic for this
+        self.preStepDyn()            
+        #step bot forward to get f_hat 
+        #save state, if we wish to restore state
+
+
+
+        #use optimization process to derive control to achieve given eef frc
+
+
+        self.env.pauseForInput("helperBotSkelHolder::frwrdSimBot_DispToFrc", waitOnInput=False)
 
 
     #first use IK to find new pose for bot to enable desired displacement, then use SPD to move to this pose
@@ -2970,9 +3089,7 @@ class helperBotSkelHolder(skelHolder, ABC):
         #set up initial quantities necessary for IK, along with dynamic quantities used for later SPD
         self.setPerStepStateVals(False)
         #initialize mimic skeleton to perform IK - first mimic current pose and vel of helper bot        
-        self.mimicBot.set_positions(skel.q)
-        self.mimicBot.set_velocities(skel.dq)
-        mimicBotEefPos = self.mimicReachBody.to_world(x=self.reachBodyOffset)
+        mimicBotEefPos = self.setMimicSkelStateToBaseSkel(skel)
         #need to find appropriate IK target position by transferring displacement in bot frame to mimic bot frame 
         mimicBotNewPos = mimicBotEefPos + desDisp
         #solve IK  - IK end effector to passed position (world coords) 
@@ -2986,7 +3103,7 @@ class helperBotSkelHolder(skelHolder, ABC):
         ana = self.helpedSkelH
         botEefCnstrntFrc = self.getEefCnstrntFrc(ulj)
         #extFrcAtEef, allCnstrntFrcAtEef, ttlCntctBdyFrcAtEef
-        anaEefPullFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef = ana.getExternalForceAtEef(ulj)
+        anaEefPullFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef = ana.getExternalForceAtEef_DBG(ulj)
         print("helperBotSkelHolder::frwrdSimBot_DispIKSPD :\n\tbot c frc @ eef : \t\t{}\tana c frc @ eef : \t\t{}\n\tana cntct frc @ eef : \t\t{}\t!!!ana frc Pull @ eef : \t{}".format(botEefCnstrntFrc, anaEefCnstrntFrc, anaCntctBdyFrcAtEef, anaEefPullFrc))
 #        #jacobian to end effector  
 #        JTransInv, JTrans, Jpull, _ = self.getEefJacobians(useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
@@ -3066,7 +3183,7 @@ class helperBotSkelHolder(skelHolder, ABC):
             
         #init and solve for bot optimal control for current target force
         self.setDesiredExtAssist(desFrc, desFrcDir, setReciprocal=recip) 
-        #initialize solve - always dynamic for this
+        #initialize & solve - always dynamic for this
         self.preStepDyn()            
         #step bot forward to get f_hat 
         #save state, if we wish to restore state
@@ -3509,7 +3626,7 @@ class robotSkelHolder(helperBotSkelHolder):
     #individual skeleton handling for calculating post-step dynamic state dictionary
     def _bldPstFrcDictPriv(self, frcD,indivCalcFlag):
         #seems to be always the same so far, although frwrd integrating 1st order using guess of dq yields inaccuracies in calculations
-        frcD['dqDiff']=np.linalg.norm(self.nextGuess[self.qdotIDXs]-self.skel.dq)
+        #frcD['dqDiff']=np.linalg.norm(self.nextGuess[self.qdotIDXs]-self.skel.dq)
         #total pull force of listed forces (doesn't include contact force calc if present)
         frcD['totPullFrc'] = frcD['jtDotTau'] - frcD['jtDotCGrav'] - frcD['jtDotMA']   
         cntctBdyTrqTtl = np.zeros(self.ndofs)
@@ -3729,7 +3846,7 @@ class robotArmSkelHolder(helperBotSkelHolder):
     #individual skeleton handling for calculating post-step dynamic state dictionary
     def _bldPstFrcDictPriv(self, frcD,indivCalcFlag):
         #seems to be always the same so far, although frwrd integrating 1st order using guess of dq yields inaccuracies in calculations
-        frcD['dqDiff']=np.linalg.norm(self.nextGuess[self.qdotIDXs]-self.skel.dq)
+        #frcD['dqDiff']=np.linalg.norm(self.nextGuess[self.qdotIDXs]-self.skel.dq)
         #total pull force of listed forces (doesn't include contact force calc if present)
         frcD['totPullFrc'] = frcD['jtDotTau'] - frcD['jtDotCGrav'] - frcD['jtDotMA']
         #target force to be seen at eef is self.use force

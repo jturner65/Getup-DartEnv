@@ -39,7 +39,9 @@ class followTraj(ABC):
         self.dt = args['dt']
         #type of trajectory
         self.trajType = args['trajType']
-
+        #set initial dynamic mobility
+        self.setObjIsMobile(self.trackObj.is_mobile())
+        self.curMobileSetting = self.trackObj.is_mobile()
         #trajectory creation messages, for debugging
         self.dbgBuildMsg = []
         #whether traj is passive or not
@@ -130,17 +132,26 @@ class followTraj(ABC):
             print("followTraj::getFuncFromNameStr : unknown advance function name : {}".format(name))
             return None
 
+    #set whether traj object is mobile or not
+    def setObjIsMobile(self, val):        
+        self.trackObj.set_mobile(val)
+        self.isDynMobile = val
+        
     #this will save this trajectory's current state and set it to be active - 
     # this is intended before test simstep to derive ana's eef frc
     #this probably won't wont work with servo actuator
     def saveAndSetActive(self):
         self.saveCurVals()
+        self.setObjIsMobile(self.curMobileSetting)        
         self.advFuncToUse = self.getFuncFromNameStr(self.dfltFuncToUseStr)
 
     #this will restore this trajectory's state and set it to be active
     #this probably won't wont work with servo actuator
     def restoreAndSetPassive(self):
         self.restoreSavedVals()
+        self.curMobileSetting = self.trackObj.is_mobile()
+        #needs to be mobile to be moved
+        self.setObjIsMobile(True)
         self.advFuncToUse = self.getFuncFromNameStr("setBallNone")
 
     #retrieve debug messages set by this trajectory and clear list
@@ -524,7 +535,7 @@ class followTraj(ABC):
     def getRandDispVal(self):pass
 
     #does not evolve constraint object, treats as passive
-    def _setBallNone(self, desPos, desVel): pass
+    def _setBallNone(self,  q, dq, desPos, desVel): pass
 
     #called as part of the setup of the trajectory
     def _setBallPosRaw(self, desPos, desVel):
