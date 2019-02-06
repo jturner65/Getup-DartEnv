@@ -91,6 +91,8 @@ class followTraj(ABC):
         #traj length multiplier -> used for setting location within trajectory relative to end points for linear this will be 1, for circular will be 2pi.
         self.trajLenMultiplier = 1.0
         self.buildSPDMats()
+        #whether this traj can stop or not
+        self.canStop = True
         #temp debugging variable
         self.tmpVelSum = np.zeros(3)
         #debug message list, value is display string
@@ -151,8 +153,8 @@ class followTraj(ABC):
         self.restoreSavedVals()
         self.curMobileSetting = self.trackObj.is_mobile()
         #needs to be mobile to be moved
-        self.setObjIsMobile(True)
-        self.advFuncToUse = self.getFuncFromNameStr("setBallNone")
+        # self.setObjIsMobile(True)
+        # self.advFuncToUse = self.getFuncFromNameStr("setBallNone")
 
     #retrieve debug messages set by this trajectory and clear list
     def getCurTrajDbgMsgs(self):
@@ -294,7 +296,9 @@ class followTraj(ABC):
         #print("Traj Incr : {}".format(self.trajIncr))
         self._setStartCurLoc()
         #calculate next step's location (changes nextPos)
-        self._calcNewPos(self.trajStep)
+        self.calcNewPosIndiv(self.trajStep)
+        #update spline between current and desired target
+        self._updateSplines()
     
     #move to some percentage of the full trajectory
     def setTrackedPosition(self, d):
@@ -305,20 +309,31 @@ class followTraj(ABC):
             d = 1        
         self.trajStep = d * self.trajLenMultiplier
         #need to determine next position based on this specified trajStep        
-        self._calcNewPos(self.trajStep)
-
+        self.calcNewPosIndiv(self.trajStep)
+        #update spline between current and desired target
+        self._updateSplines()
+    
+    #use passed move vec to determine where to move - mov vec is derived from optimization process
+    def setOptDeriveMovVec(self, _mVec):
+        if(self.debug):
+            keyList = ["Des Move Vec","trajStep","avg vel seen"]
+            msgList = [_mVec, self.trajStep,self.tmpVelSum/(1.0+ 1.0*self.frame_skip)]
+            self.trajPrint("followTraj::setOptDeriveMovVec : ",keyList, msgList)
+        self._setStartCurLoc()
+        #only currently works for gaussian trajs
+        self.setNewLocVals(np.copy(_mVec))
+        #update spline between current and desired target
+        self._updateSplines()
+    
     #calculate new position - call individual calculation and then scale displacements by frameskip if necessary
     #this is called at the start of every control application step
-    def _calcNewPos(self, t):
-        self.calcNewPosIndiv(t)
+    def _updateSplines(self):
+
         #divide expected per-step movement into # frames per step pieces.
         div = (1.0 * self.frame_skip)
-
         #amount of trajectory increment that should be applied per frame skip
-        self.nextFrameIncr =  self.trajIncr/div 
- 
+        self.nextFrameIncr =  self.trajIncr/div  
         T = (div*self.dt) #total time to go from init to final
-
         #determine coefficients of spline based on p0, p1, v0, v1, such that acceleration is minimized (not const)
         #use these so that position/velocity obey initial and final constraints
         #init position, final position, init vel, final vel
@@ -497,8 +512,10 @@ class followTraj(ABC):
             msgList = [self.perStepAccel, perStepAccelFromPos, nextLocPerFrame]
             self.trajPrint("followTraj::advTrackedPosition",keyList, msgList)
             #print("advTrackedPosition : actual accel seen per ts : {} derived from postion : {} next Desired Loc : {} ".format(self.perStepAccel, perStepAccelFromPos,nextLocPerFrame) )    
+
         #advance trajStep variable, check if finished
-        doneTraj = self.incrTrajStepIndiv(self.nextFrameIncr)  
+        self.trajStep += self.nextFrameIncr
+        doneTraj = (self.canStop) and (self.trajStep >= 1.0)
         #returns whether we are at end of trajectory or not
         return doneTraj
     
@@ -519,13 +536,9 @@ class followTraj(ABC):
     @abstractmethod
     def calcNewPosIndiv(self, t): pass
 
-    #move object along
-    @abstractmethod
-    def incrTrajStepIndiv(self, perFrameIncr): pass
-
     #used to force traj vals - only currently implemented for gauss traj
     @abstractmethod
-    def setNewLocVals(self,vals):pass
+    def setNewLocVals(self, smplMvDirVec):pass
 
     #return min and max bounds of displacement for a single iteration
     @abstractmethod
@@ -669,6 +682,8 @@ class circleTraj(followTraj):
         self.trajLenMultiplier = 2.0 * np.pi
         #make trajIncr negative to match formula
         self.trajIncr *= -1
+        #whether this traj can stop or not - circle traj never has ending
+        self.canStop = False
 
     #return min and max bounds of displacement for a single iteration
     def getMinMaxBnds(self): 
@@ -680,7 +695,6 @@ class circleTraj(followTraj):
         cts = np.cos(self.trajIncr)
         sts = np.sin(self.trajIncr) 
         return self.ballTrajCtr - np.array([(self.ballXradCtilt * cts - self.ballYradStilt * sts), (self.ballYradCtilt * sts + self.ballXradStilt * cts), 0])
-
 
     #passed endLoc is ignored
     def initTrajIndiv(self, endLoc):        
@@ -694,7 +708,7 @@ class circleTraj(followTraj):
             ballPos = self.ballTrajCtr - ctrOffset
             print('Tracking Ball location in initTracking : {} | calc pos : {}\n'.format(self.trackObj.com(), ballPos))
 
-    def setNewLocVals(self,vals):
+    def setNewLocVals(self, smplMvDirVec):
         print("circleTraj::setNewLocVals : Not implemented")
 
 
@@ -704,11 +718,6 @@ class circleTraj(followTraj):
         #circle has no end, always false for end of trajectory
         self.nextLoc = self.ballTrajCtr - np.array([(self.ballXradCtilt * cts - self.ballYradStilt * sts), (self.ballYradCtilt * sts + self.ballXradStilt * cts), 0])
         self.nextDispVec = self.nextLoc - self.curLoc
-        
-    def incrTrajStepIndiv(self, perFrameIncr):
-        #evolve trajStep, never is finished
-        self.trajStep += perFrameIncr
-        return False    
     
 #linear trajectory        
 class linearTraj(followTraj):
@@ -748,14 +757,8 @@ class linearTraj(followTraj):
         self.nextLoc = self.stLoc + (t * self.moveVec)
         self.nextDispVec = self.nextLoc - self.curLoc
 
-    def setNewLocVals(self,vals):
+    def setNewLocVals(self, smplMvDirVec):
         print("linearTraj::setNewLocVals : Not implemented")
-
-
-    def incrTrajStepIndiv(self, perFrameIncr): 
-        self.trajStep += perFrameIncr
-        #line is done when we've moved length along dirvec
-        return (self.trajStep >= 1.0)
 
 #trajectory that follows a gaussian distribution toward a set end point
 #directed wandering with mean direction being from current location to end point
@@ -826,9 +829,9 @@ class gaussTraj(followTraj):
         smplMvDirRaw = self.np_random.normal(loc=mvDir, scale=sclAra)
         smplMvDist = np.abs(self.np_random.normal(loc=d, scale=scale*.05))
         smplMvDirLen = np.linalg.norm(smplMvDirRaw)
+        #move some random distance based on how far we must move
         smplMvDirVec = smplMvDirRaw * smplMvDist/smplMvDirLen  
         return smplMvDirVec, curT, distToMove, scale
-
 
     #calculate new position and displacement vector based on desired location along vector between start and end loc given by t
     def calcNewPosIndiv(self, t):
@@ -842,8 +845,7 @@ class gaussTraj(followTraj):
             keyList = ['Traj Type', 'stPos','endPos','next T','cur T','distToMove','scale','curPos','nextPos','nextDispVec','nextTrajIncr'  ]
             msgList = [self.trajType, self.stLoc,self.endLoc, '{:.5f}'.format(t), '{:.5f}'.format(curT), '{:.5f}'.format(distToMove), '{:.5f}'.format(scale),self.curLoc, self.nextLoc, self.nextDispVec, '{:.5f}'.format(self.trajIncr)]
             self.trajPrint("gaussTraj::calcNewPosIndiv", keyList, msgList, prEnd=" | ")
-
-
+ 
     #sets new location values based on current location and passed movement vector
     def setNewLocVals(self, smplMvDirVec):
         curT = self._locAlongLine(self.curLoc)
@@ -874,16 +876,12 @@ class gaussTraj(followTraj):
         t = relStLoc.dot(self.dirStToEnd)
         return t
     
-    #new tracked position is dependent on ratio of current distance between start and end points current location is projected to        
-    def incrTrajStepIndiv(self,perFrameIncr): 
-        #increment trajStep, determine if at end of trajectory
-        self.trajStep += perFrameIncr
-        return (self.trajStep >= 1.0)
-    
 #parabolic trajectory        
 class parabolicTraj(followTraj):
     def __init__(self, args):
         followTraj.__init__(self, args)
+        #set to be false until trajectory actually implemented
+        self.canStop = False
 
     #return min and max bounds of displacement for a single iteration
     def getMinMaxBnds(self): 
@@ -905,15 +903,8 @@ class parabolicTraj(followTraj):
         print('parabolicTraj::calcNewPosIndiv : Not Implemented')
         self.nextDispVec = self.nextLoc - self.curLoc
 
-    def setNewLocVals(self,vals):
+    def setNewLocVals(self, smplMvDirVec):
         print("parabolicTraj::setNewLocVals : Not implemented")
-
-    def incrTrajStepIndiv(self,perFrameIncr):
-        print('parabolicTraj::incrTrajStepIndiv : Not Implemented')      
-        #evolve trajstep
-        self.trajStep += perFrameIncr
-       
-        return False
     
 ##trajectory specified by equation
 #class eqTraj(followTraj):

@@ -7,6 +7,7 @@ import numpy as np
 from gym import utils
 from gym.envs.dart import assist2bot_env
 from os import path
+from skelHolders import robotArmSkelHolder
 
 from collections import defaultdict
 
@@ -79,6 +80,10 @@ class DartStandUp3dAssistEnv(assist2bot_env.DartAssist2Bot_Env, utils.EzPickle):
         botDict = defaultdict(int,{'setBotSolve':0, 'setBotDynamic':1, 'botSolvingMethod':0, 'SPDGain':10000000,'frcBasedAssist':True})
         self.setTrainAndInitBotState(self.trainPolicy, botDict=botDict)                                
         utils.EzPickle.__init__(self)
+
+    #return appropriate robot arm skel holder for this environment
+    def getBotSkelHldr(self, skel, widx, stIDX, eefOffset):
+        return robotArmSkelHolder(self, skel, widx, stIDX, fTipOffset=eefOffset)  
  
     #individual environment-related components of assist initialization
     def initAssistTraj_indiv(self): 
@@ -198,12 +203,12 @@ class DartStandUp3dAssistEnv(assist2bot_env.DartAssist2Bot_Env, utils.EzPickle):
         done = False
         fr = 0
         #get target force, either from currently assigned assist force, or from querying value function
-        tarFrc, tarFrcMult = self.getTargetAssist(ANA.getObs())
+        tarFrc, tarFrcMult = self.getVFTargetAssist(ANA.getObs()) 
         #iterate every frame step, until done
         while (not done) and (fr < self.frame_skip):  
             fr +=1  
 #            #get target force, either from currently assigned assist force, or from querying value function
-#            tarFrc, tarFrcMult = self.getTargetAssist(ANA.getObs())
+#            tarFrc, tarFrcMult = self.getVFTargetAssist(ANA.getObs())
             #find new action for ANA based on helper bot's effort to generate target force
             action, botResFrcDict = self.frwrdStepTrajBotGetAnaAction(fr, useDet, policy, tarFrc, botRecipFrc, restoreBotSt=False)
             #save for dbg

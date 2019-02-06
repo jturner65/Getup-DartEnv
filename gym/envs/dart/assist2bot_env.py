@@ -348,7 +348,7 @@ class DartAssist2Bot_Env(dart_env_2bot.DartEnv2Bot, ABC):
         #print("-----------------------endCntrlStepTraj - new location generated for next obs and next control step ----------------------------")
 
     #will return an optimal assistance prediction given an observation of Ana. 
-    def getTargetAssist(self, obs):
+    def getVFTargetAssist(self, obs):
         #assistance component of passed observation
         _, origAssist, _ = self.getObsComponents( obs)
         if(self.vfOptObj is None): #no vfOptObj so just use pre-set forces at locattion of eef, if used

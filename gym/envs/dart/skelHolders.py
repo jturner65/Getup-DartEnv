@@ -71,7 +71,7 @@ class skelHolder(ABC):
         #per step timestep - including frameskip == frameskip * world.dt
         self.perFrameSkip_dt=self.env.dt
         
-        #ground friction from environment
+        #ground friction from environment - seems dart's friction values are super high - this is 100
         self.groundFric = self.env.groundFric
         #gravity of this world
         self.grav = self.env.dart_world.gravity()
@@ -258,7 +258,7 @@ class skelHolder(ABC):
         if (len(bodyNamesAra) > 0):
             self._setFootHandBodyNames(bodyNamesAra[0], bodyNamesAra[1], bodyNamesAra[2], bodyNamesAra[3]) 
         else :#not relevant for KR5 arm robot
-            print("---- No foot/hand/head body names specified, no self.StandCOMHeight derived ----")
+            print("skelHolders::setInitialSkelParams :---- No foot/hand/head body names specified for {}, no self.StandCOMHeight derived ----".format(self.name))
 
     #called initially before any pose modification is done - pose of skel by here is pose specified in skel/urdf file
     def _setFootHandBodyNames(self,lf_bdyNames, rf_bdyNames, h_bodyNames, headBodyName):
@@ -269,7 +269,7 @@ class skelHolder(ABC):
         self.headBodyName = headBodyName
         for ft in self.feetBodyNames:
             self.skel.body(ft).set_friction_coeff(self.groundFric)
-        print('skelHolder::setFootHandBodyNames : set values for initial height above avg foot location  - ASSUMES CHARACTER IS UPRIGHT IN SKEL FILE. Must be performed before desired pose is set')   
+        print('skelHolder::setFootHandBodyNames ({}): set values for initial height above avg foot location  - ASSUMES CHARACTER IS UPRIGHT IN SKEL FILE. Must be performed before desired pose is set'.format(self.name))   
         #specific to instancing class - only RL-involved skel holders should have code in this     
         self._setInitRWDValsPriv()     
     
@@ -283,7 +283,7 @@ class skelHolder(ABC):
     def setUseLinJacobian(self, val):
         self.useLinJacob = val
         #update the use force vector to match appropraite dimensions
-        self.useForce = self.setUseFrc(val,self.desExtFrcVal)
+        return self.setUseFrc(val,self.desExtFrcVal)
            
     #initialize constraint/target locations and references to constraint bodies
     def initConstraintLocs(self,  cPosInWorld, cBody):
@@ -1164,7 +1164,7 @@ class skelHolder(ABC):
         if (useLinJacob) :             
             useForce = np.copy(desFrc)
         else : 
-            #wrench TODO verify target orientation should be 0,0,0
+            #wrench TODO verify target orientation component should be 0,0,0
             useForce = np.zeros(6)
             useForce[3:]=desFrc
         return useForce
@@ -1545,7 +1545,38 @@ class skelHolder(ABC):
         #if saving state-action-state' info, save here and then reinitialize array holding states
         if self.recStateActionRes : 
             self._saveStateData()
-    
+
+    #return jacobian transpose for all 4 contact bodies 
+    #this will be a single matrix of n x 3m dim where n is # of dofs
+    #and m is # of contact forces (4) - treating each foot body's cop as com with y dim == 0
+    def getCntctJTranspose(self):
+        #get 
+        #3 values for each force (4 forces)  x numdofs  linear_jacobian_deriv
+        cntctJ = np.zeros([12, self.ndofs])
+        cntctJDeriv = np.zeros([12, self.ndofs])
+        idx = 0
+        COPPerBody = np.zeros([12])
+        offset = np.ones([3]) * -.1
+
+
+        for bodyName in self.feetBodyNames:
+            body = self.skel.bodynode(bodyName)
+            #this is the jacobian at an estimate of the COP of a foot-related
+            #body in contact with the ground - projecting the body's COM into world 
+            #coords, then setting y==0, and finding jacobian at that location
+            COMinWorld = body.com() + offset
+            bodyOffset = body.to_local(COMinWorld)
+            #J is 3 rows x ndofs cols - get com of each body in world, moved to ground (approx position of contact) and move to local space
+            J = body.linear_jacobian(offset=bodyOffset)
+            dJ = body.linear_jacobian_deriv(offset=bodyOffset)
+            #TODO use world jacobian if wanting contact torque and force (6 x ndof)
+            #fill by rows
+            nextIdx = idx+np.size(J, 0)
+            cntctJ[idx:nextIdx, : ] = J
+            cntctJDeriv[idx:nextIdx, : ] = dJ
+            COPPerBody[idx:nextIdx] = COMinWorld
+            idx = nextIdx
+        return cntctJ, cntctJDeriv,  np.transpose(cntctJ), COPPerBody     
     ######################################################
     #   abstract methods 
     ######################################################    
@@ -1974,7 +2005,7 @@ class ANASkelHolder(skelHolder):#, ABC):
 
         resDict = self._calcCmpFrcAtEefForTau(assist, tau, debug)
        
-        #restore ANA's state
+        #restore ANA's state - done in this order so that dart retains info
         skel.set_accelerations(ddq)          
         skel.set_positions(q)
         skel.set_velocities(dq)  
@@ -2558,15 +2589,14 @@ class helperBotSkelHolder(skelHolder, ABC):
         self.numOptIters = 10
         #the holder of the human to be helped - 
         self.helpedSkelH = None
-        #default to 0 contact dimensions
-        self.numCntctDims = 0
         #to hold constraint body
         self.cnstrntBody = None
         #limit for qdot proposals only if box constraints are set to true
         self.qdotLim = 5.0   
         #set in child classes
         self.bndCnst = -1      
-
+        #needs to be set after helper skel is set
+        self.nOptDims = -1
         #use 3dim jacobians for frc calcs and build initial useForce of appropriate dims
         self.useForce = self.setUseLinJacobian(True)
        
@@ -2582,13 +2612,10 @@ class helperBotSkelHolder(skelHolder, ABC):
         self.doMatchPose = False
         #whether or not to include box constraints for allowable values in optimization
         self.useBoxConstraints = False
+        #whether we pre-calculate tau-pull per step - only use on force-based policy control
+        self.calcTauPullPerStep = True
         #whether to use operational space controller
         self.useOSControl = False
-        #the force being used for optimization process
-        numDim = 3 if (self.useLinJacob) else 6
-        self.useForce = np.zeros(numDim)
-        #sets dimension of optimization vector : function lives in child class
-        self.nOptDims = self.getNumOptDims()
         #old dq, to calculate ddq
         self.oldDq = np.zeros(self.ndofs)
       
@@ -2630,10 +2657,14 @@ class helperBotSkelHolder(skelHolder, ABC):
         self.initHelperBot()
         
     #this is the skelHolder for the assisting robot, so set the human to be nonNull
+    #this is set right after all skels are loaded and all skelHolders are made
     def setHelpedSkelH(self, skelH):
         self.helpedSkelH = skelH
         #reset observation dim to match this skel and human skel's combined obs
-        self.setObsDim(self.obs_dim + skelH.obs_dim)   
+        self.setObsDim(self.obs_dim + skelH.obs_dim) 
+        #sets dimension of optimization vector : function lives in child class - may be dependent on helperSkelH, so must be set afterwards
+        self.nOptDims = self.getNumOptDims()
+          
 
     #robot uses combined human and robot state, along with force observation (from human)
     def getObs(self):
@@ -2689,7 +2720,7 @@ class helperBotSkelHolder(skelHolder, ABC):
 #        else :
         self.nextGuess=np.zeros(self.nOptDims) 
         #set root dof initial guess of taus to be 0
-        stTauRoot=(self.ndofs+self.numCntctDims)
+        stTauRoot=(self.ndofs)
         self.nextGuess[stTauRoot:(stTauRoot+self.stTauIdx)] = np.zeros(self.stTauIdx)
         #these are to hold last iteration values, in case opt throws exception
         self.prevGuess = np.copy(self.nextGuess)
@@ -2734,22 +2765,22 @@ class helperBotSkelHolder(skelHolder, ABC):
     @abstractmethod
     def initOptPoseData_Indiv(self):
         pass
-    
-    #initialize lists of idxs for individual decision variables in x vector
+ 
+    #initialize lists of idxs for individual decision variables in x vector - always start with bot's qdot and tau
     def initDecVarRanges(self):
         #idx aras to isolate variables in constraint and optimization functions
         endIdx = self.ndofs
-        self.qdotIDXs = np.arange(0, endIdx)
-        #if uses contacts, put contacts here.
-        if(self.numCntctDims > 0):
-            stIdx = endIdx
-            endIdx = stIdx + self.numCntctDims
-            self.fcntctIDXs = np.arange(stIdx,endIdx)
+        self.qdotIDXs = np.arange(0, endIdx)                    #bot qdot
         stIdx = endIdx
         endIdx = stIdx + self.ndofs
-        self.tauIDXs = np.arange(stIdx, endIdx)
-        
-        
+        self.tauIDXs = np.arange(stIdx, endIdx)                 #bot tau
+        #instance-specific opt variable idxs in bounds
+        self.initDecVarRanges_Indiv(endIdx)
+
+    #manage any instance-specific optimization variables
+    @abstractmethod
+    def initDecVarRanges_Indiv(self, endIdx):  pass
+          
     #set values for decision variable bounds
     #upIdxAra : idxs of up direction for contacts, if contacts are decision values
     #idxTorqueSt : idx where torques start
@@ -2772,6 +2803,10 @@ class helperBotSkelHolder(skelHolder, ABC):
         if (self.stTauIdx > 0):        
             self.lbndVec[idxTorqueSt:(idxTorqueSt+self.stTauIdx)] = -tolVal
             self.ubndVec[idxTorqueSt:(idxTorqueSt+self.stTauIdx)] = tolVal
+        self.buildOptBounds_Indiv()
+
+    @abstractmethod
+    def buildOptBounds_Indiv(self):  pass
 
 
     #build list of tuples of idx and multiplier to modify wts array/wts matrix for qdot weighting
@@ -2794,6 +2829,7 @@ class helperBotSkelHolder(skelHolder, ABC):
         #qdot weights for velocity matching-based objective func
         #obj func deriv for sqrd obj funcs
         self.qdotWts = np.diag(self.qdotWtsVec)       
+
     #instance optimizer and set optimizer box constraints/bounds
     def initOptimizer(self, alg=nlopt.LN_COBYLA):
         #create optimizer
@@ -2839,7 +2875,7 @@ class helperBotSkelHolder(skelHolder, ABC):
         
     
     #called from prestep, set important values used to track trajectory ball and retain original state info before step
-    def setPerStepStateVals(self, calcDynQuants):
+    def setPerStepStateVals(self, calcDynQuants, calcTauPull=True):
         #tracking body curent location and last location, for vel vector
         self.trackBodyLastPos = self.trackBodyCurPos
         #world position of tracked position on ball
@@ -2853,7 +2889,11 @@ class helperBotSkelHolder(skelHolder, ABC):
         self.curEffPos = self.reachBody.to_world(x=self.reachBodyOffset)
         #whether or not ot calculate dynamic jacobians and other quantities
         #torque cntrol desired to provide pulling force at contact location on reaching hand    
-        self.Tau_JtFpull, self.JtPullPInv, self.Jpull, self.JpullLin = self.getPullTau(self.useLinJacob)    
+        if(calcTauPull):#resTau, JTransInv, Jpull, Jpull[-3:,:]
+            self.Tau_JtFpull, self.JtPullPInv, self.Jpull, self.JpullLin = self.getPullTau(self.useLinJacob)    
+        else : 
+            self.JtPullPInv, self.JTrans, self.Jpull, _ = self.getEefJacobians(self.useLinJacob, body=self.reachBody, offset=self.reachBodyOffset)
+            self.JpullLin = self.Jpull[-3:,:]
         if(calcDynQuants):                   
             #current end effector velocity in world space
             self.currEffVel = self.Jpull.dot(self.curQdot)
@@ -2938,7 +2978,7 @@ class helperBotSkelHolder(skelHolder, ABC):
     def setSimVals(self):        
         #self.oneAOvTS = self.dofOnes/self.perSimStep_dt
         #per timestep constraint and eef locations and various essential jacobians
-        self.setPerStepStateVals(True)
+        self.setPerStepStateVals(True, self.calcTauPullPerStep)
         #Mass Matrix == self.skel.M
         #M is dof x dof 
         self.M = self.skel.M
@@ -2946,9 +2986,9 @@ class helperBotSkelHolder(skelHolder, ABC):
         #M / dt = precalc for MAconst - multiply by qdotPrime
         self.M_ovDt =self.M/self.perSimStep_dt
         #derivative of MA eq w/respect to qdotprime
-        self.M_dqdotPrime = self.M.dot(self.oneAOvTS)
+        #self.M_dqdotPrime = self.M.dot(self.oneAOvTS)
         #precalc -Mqdot/dt
-        self.Mqd = -self.M_ovDt.dot(self.skel.dq)
+        self.NegMqd = -self.M_ovDt.dot(self.skel.dq)
         #CfG == C(q,dq) + G; it is dof x 1 vector
         self.CfG = self.skel.coriolis_and_gravity_forces() 
         #TODO constraint forces - investigate
@@ -2978,9 +3018,9 @@ class helperBotSkelHolder(skelHolder, ABC):
 
     #prestep for kinematic sim of bot - ik to appropriate location
     def preStepKin(self):
-        if (self.debug):
-            print('helperBotSkelHolder::preStepKin : {} robot set to not mobile, so no optimization being executed, but IK to constraint position performed'.format(self.skel.name))
-        self.setPerStepStateVals(False)
+        #if (self.debug):
+        print('helperBotSkelHolder::preStepKin : {} robot set to not mobile, so no optimization being executed, but IK to constraint position performed'.format(self.skel.name))
+        self.setPerStepStateVals(False, False)
         self.IKtoCnstrntLoc()
 
         
@@ -3000,10 +3040,9 @@ class helperBotSkelHolder(skelHolder, ABC):
         else :            
             #build optimizer with LD_SLSQP alg - remake every time to handle static baloney seems to be happening
             self.initOptimizer(nlopt.LD_SLSQP)
-            #mma opt formulat only handles inequality constraints - use pos and neg ineq for eq constraint
+            #mma opt formula only handles inequality constraints - use pos and neg ineq for eq constraint
             #self.initOptimizer(nlopt.LD_MMA)
             #initialize optimizer - objective function is minimizer
-            #TODO set which objectives we wish to use
             self.optimizer.set_min_objective(self.objFunc)                
             #set constraints F=MA and fCntctCnst
             #need to set tol as vector        
@@ -3014,12 +3053,12 @@ class helperBotSkelHolder(skelHolder, ABC):
             #self.optimizer.add_inequality_constraint(self.MAconstPos, self.cnstTol[0])
             #self.optimizer.add_inequality_constraint(self.MAconstNeg, self.cnstTol[0])
             #expects inequality constraint f(x) <= 0   
+            #instance specific equality/inequality constraints - ground contact forces, for example
+            self.setInstanceConstrnts()           
             #stop if less than tol changes happen to objective function eval - needs to be small
             self.optimizer.set_ftol_rel(1e-13)
             #stop after numOptIters
             self.optimizer.set_maxeval((int)(self.numOptIters))
-            #instance specific inequality constraints - ground contact forces, for example
-            self.setInstanceConstrnts()           
             
             #print('stopping if obj func <= {}'.format(self.optimizer.get_stopval()))
             #run optimizer - use last result as guess
@@ -3034,16 +3073,18 @@ class helperBotSkelHolder(skelHolder, ABC):
             if(self.monitorOptGuess):
                 self._checkiMinMaxVals(self.nextGuess, self.minMaxGuessDict)
                 
-            self.doStepTestsAndSetTau_OptCntrl()        
+            self.doStepTestsAndSetTau_OptCntrl()    
+            
     
     #dt set to timestep * frameskips functionality before sim step is executed on this skel
     #here is where we calculate the robot's control torques
     def _preStepIndiv(self, actions):   
-
         #if not mobile (dynamic) skeleton, perform IK on position
         if (not self.isFrwrdSim):  #if not dynamic and this is called then we want to IK to position
+            print('helperBotSkelHolder::_preStepIndiv : using preStepKin for prestep/calc for bot')
             self.preStepKin()
         else :                      #dynamic, and prestep called, means we want to solve opt control
+            print('helperBotSkelHolder::_preStepIndiv : using preStepDyn for prestep/calc for bot')
             self.preStepDyn()       
 
     #use force ana sees at eef using proposed optimal action to derive assist force for bot 
@@ -3068,7 +3109,9 @@ class helperBotSkelHolder(skelHolder, ABC):
         #init and solve for bot optimal control for current target force
         self.setDesiredExtAssist(desFrc, desFrcDir, setReciprocal=True) 
         #initialize & solve - always dynamic for this
-        self.preStepDyn()            
+        #self.preStepDyn()     
+        #TODO remove
+        #self.dbgResetTau()  
         #step bot forward to get f_hat 
         #save state, if we wish to restore state
 
@@ -3087,7 +3130,7 @@ class helperBotSkelHolder(skelHolder, ABC):
         #solve for IK to des displacement (desDisp) from current constraint location
         #IK part 
         #set up initial quantities necessary for IK, along with dynamic quantities used for later SPD
-        self.setPerStepStateVals(False)
+        self.setPerStepStateVals(False, False)
         #initialize mimic skeleton to perform IK - first mimic current pose and vel of helper bot        
         mimicBotEefPos = self.setMimicSkelStateToBaseSkel(skel)
         #need to find appropriate IK target position by transferring displacement in bot frame to mimic bot frame 
@@ -3204,7 +3247,24 @@ class helperBotSkelHolder(skelHolder, ABC):
         if(restoreBotSt):
             self.skel.set_states(saved_state)
             
-        return f_hat, self.frcD    
+        return f_hat, self.frcD  
+ 
+
+    #initialize contact-based structures used to calculate contact constraints
+    def initCntctStructs(self, fcntct_y_idxAra, idxCntctStart, numCntctDims):      
+        #up vector for all 4 contact forces
+        fcntctUp = np.zeros(numCntctDims)
+        fcntctUp[fcntct_y_idxAra] = 1
+#        #derivative of contact force eq - setting to negative since cone calc uses difference in y dir
+        fcntctDot = np.ones(numCntctDims)
+        fcntctDot[fcntct_y_idxAra] *= -1
+        #tolerance of contact constraints (4 constraints) - 1 scalar value per contact
+        # 1/3 # of contact dims
+        szCntctTol = int(numCntctDims/3)
+        cnstTolCNTCT = np.ones(szCntctTol)*1e-8
+
+        return fcntctUp, fcntctDot, cnstTolCNTCT
+
     
     ######################################################
     #   cost/reward methods 
@@ -3305,8 +3365,7 @@ class helperBotSkelHolder(skelHolder, ABC):
         return self.MAcnstVec(result, x, grad)
     def MAconstVecNeg(self, result, x, grad):
         return -self.MAcnstVec(result, x, grad) 
-    
-    
+     
     #set all instance-specific constraints
     @abstractmethod
     def setInstanceConstrnts(self):
@@ -3414,26 +3473,27 @@ class robotSkelHolder(helperBotSkelHolder):
             modAra.append((i,0.1))        
         return modAra
 
+    def initDecVarRanges_Indiv(self, endIdx):   
+        stIdx = endIdx
+        endIdx = stIdx + self.numCntctDims
+        self.cntctStIDX = stIdx
+        self.fcntctIDXs = np.arange(stIdx,endIdx)
+        
+    def buildOptBounds_Indiv(self): 
+        pass
+         
     #initialize nlopt optimizer variables specific to this robot - contact vars
     def initOptIndiv(self):
         #index array of locations in fcntct array of y component of contact force - should always be positive
         fcntct_y_idxAra = np.array([1,4,7,10])
-        #modify lower bound to handle contact bounds - no negative y contact force
-        tolVal= 1e-12
-        offsetYIdxs = (fcntct_y_idxAra + self.ndofs)
         if(self.useBoxConstraints):
+            #modify lower bound to handle contact bounds - no negative y contact force
+            tolVal= 1e-12
+            offsetYIdxs = (fcntct_y_idxAra + self.cntctStIDX)
             self.lbndVec[offsetYIdxs] = tolVal     
         
-        #up vector for all 4 contact forces
-        self.fcntctUp = np.zeros(self.numCntctDims)
-        self.fcntctUp[fcntct_y_idxAra] = 1
-#        #derive of contact force eq - setting to negative since cone calc uses difference in y dir
-        self.fcntctDot = np.ones(self.numCntctDims)
-        self.fcntctDot[fcntct_y_idxAra] *= -1
-        #tolerance of contact constraints (4 constraints) - 1 scalar value per contact
-        # 1/3 # of contact dims
-        szCntctTol = int(self.numCntctDims/3)
-        self.cnstTolCNTCT = np.ones(szCntctTol)*1e-8
+        self.fcntctUp, self.fcntctDot,  self.cnstTolCNTCT = self.initCntctStructs(fcntct_y_idxAra, self.cntctStIDX, self.numCntctDims)
+   
                                 
     #assistant robot skel's individual per-reset settings
     def _resetIndiv(self, dispDebug):
@@ -3441,32 +3501,7 @@ class robotSkelHolder(helperBotSkelHolder):
 #        print('bot foot height : {} '.format(self.skel.body('h_heel_left').com()[1] ))
 #        print('bot com  : {} '.format(self.skel.com() ))
         pass
-
-    #return jacobian transpose for all 4 contact bodies
-    #this will be a single matrix of n x 3m dim where n is # of dofs
-    #and m is # of contact forces (4)
-    def getCntctJTranspose(self):
-        #get 
-        #3 values for each force (4 forces)  x numdofs
-        cntctJ = np.zeros([12, self.ndofs])
-        idx = 0
-        COPPerBody = np.zeros([12])
-        for bodyName in self.feetBodyNames:
-            body = self.skel.bodynode(bodyName)
-            #this is the jacobian at an estimate of the COP of a foot-related
-            #body in contact with the ground - projecting the body's COM into world 
-            #coords, then setting y==0, and finding jacobian at that location
-            COMinWorld = body.com()
-            COMinWorld[1] = 0
-            #J is 3 rows x ndofs cols - get com of each body in world, moved to ground (approx position of contact) and move to local space
-            J = body.linear_jacobian(offset=body.to_local(COMinWorld))
-            #TODO use world jacobian if wanting contact torque and force (6 x ndof)
-            #fill by rows
-            nextIdx = idx+np.size(J, 0)
-            cntctJ[idx:nextIdx, : ] = J
-            COPPerBody[idx:nextIdx] = COMinWorld
-            idx = nextIdx
-        return np.transpose(cntctJ), COPPerBody             
+     
     
     #initialize these values every time step - as per Abe' paper they are constant per timestep
     def setSimValsPriv(self):
@@ -3474,8 +3509,8 @@ class robotSkelHolder(helperBotSkelHolder):
         self.oldCntctData = self.getMyContactInfo()        
         #Jacobian for all contact forces (appended)
         #world location of contact force - vector of 12 x 1 dims
-        self.JtCntctTrans, self.wrldCOPPerFootBody = self.getCntctJTranspose()
-        #set contact gradient
+        self.JCntct, self.JCntctDeriv, self.JtCntctTrans, self.wrldLocPerFootBody = self.getCntctJTranspose()
+        #set contact gradient 
         self.JtCntctGrad = np.full_like(self.fcntctIDXs,0)
         for i in range(len(self.fcntctIDXs)):
             self.JtCntctGrad[i]=self.JtCntctTrans[:,i].sum(axis=0)        
@@ -3532,7 +3567,7 @@ class robotSkelHolder(helperBotSkelHolder):
 #        CfG = self.skel.coriolis_and_gravity_forces()
 #        self.skel.set_velocities(self.curQdot)
         #TODO Add constraint force?
-        maRes = self.M_ovDt.dot(qdotPrime) + self.Mqd + self.CfG #+ self.CntrntFrc
+        maRes = self.M_ovDt.dot(qdotPrime) + self.NegMqd + self.CfG #+ self.CntrntFrc
         
         #cntctRes is positive, because force is up (reactive collision force)
         cntctRes = self.JtCntctTrans.dot(fcntct)
@@ -3727,11 +3762,18 @@ class robotArmSkelHolder(helperBotSkelHolder):
     def initOptIndiv(self):
         pass
 
+    #initialize lists of idxs for individual decision variables in x vector
+    def initDecVarRanges_Indiv(self, endIdx):  
+        pass
+
     #return idx's of dofs that are to be matched if pose matching objective is used
     def initOptPoseData_Indiv(self):
         #TODO find idxs to match pose - passing empty array
         return np.empty( shape=(0, 0), dtype=int)
 
+    #to inform of using wrong class for skel arm holder
+    def frwrdStepBotForDisp(self, _desDispVec) :    
+        print('robotArmSkelHolder::frwrdStepBotForDisp : using wrong class for skel holder to derive control for bot arm - need to instance bot holder class "robotArmDispSkelHolder" instead')
 
     #constraints specific to this instance, if there are any - here they are assigned to optimization problem, as in comment
     #and they need to be defined in this class too
@@ -3746,7 +3788,15 @@ class robotArmSkelHolder(helperBotSkelHolder):
 
     #assistant robot skel's individual per-reset settings
     def _resetIndiv(self, dispDebug):
+        pass
 
+    def buildOptBounds_Indiv(self): 
+        pass
+
+    #frc-based optimization does nothing here 
+    # disp based opt will solve for control for bot given desired control for ANA and passed optimal displacement for ANA's state
+    #ANA and bot are connected via constraints, so we want their eef vels and locations to match
+    def solveBotOptCntrlForDisp(self, _desDispVec):
         pass
     
     #call this to return objective function value that minimizes velocity and 
@@ -3811,7 +3861,7 @@ class robotArmSkelHolder(helperBotSkelHolder):
 #            print('CfG is not updated when qdot changed')
 #        else:
 #            print('Success!')
-        maRes = self.M_ovDt.dot(qdotPrime) + self.Mqd + self.CfG #- self.CntrntFrc
+        maRes = self.M_ovDt.dot(qdotPrime) + self.NegMqd + self.CfG #- self.CntrntFrc
         
         #build pull force and subtract tau estimate
         #pulling force relative to external force is negative - want opposite direction
@@ -3841,6 +3891,476 @@ class robotArmSkelHolder(helperBotSkelHolder):
         passMATest = self.dbg_testMAconstVec(self.nextGuess)
         #self.dbgShowTorques(guessTau)
         self.tau = guessTau
+
+
+    #individual skeleton handling for calculating post-step dynamic state dictionary
+    def _bldPstFrcDictPriv(self, frcD,indivCalcFlag):
+        #seems to be always the same so far, although frwrd integrating 1st order using guess of dq yields inaccuracies in calculations
+        #frcD['dqDiff']=np.linalg.norm(self.nextGuess[self.qdotIDXs]-self.skel.dq)
+        #total pull force of listed forces (doesn't include contact force calc if present)
+        frcD['totPullFrc'] = frcD['jtDotTau'] - frcD['jtDotCGrav'] - frcD['jtDotMA']
+        #target force to be seen at eef is self.use force
+        frcD['targetEEFFrc'] = self.useForce
+        
+        #if bot is connected to constraint, include these values        
+        #cnstrntFrc = self.skel.constraint_forces()
+        #monitor constraint forces to see if force seen by human is appropriate pull force        
+        #frcD['cnstf'] = cnstrntFrc
+        #store JtPullPInv_new in dict - get constraint forces observed at eef
+        #frcD['jtDotCnstFrc'] = frcD['JtPullPInv_new'].dot(cnstrntFrc)        
+        #total pull force of listed forces (doesn't include contact force calc if present)
+        #frcD['totPullFrcCnst'] = frcD['totPullFrc'] + frcD['jtDotCnstFrc'] 
+
+        return frcD
+
+    #display results of fwd simulation - test results, display calculated vs simulated force results at end effector
+    def _dispFrcEefResIndiv(self):         
+        pass
+
+    #display this classes guess configuration 
+    def dbgDispGuessPriv(self, guess, name=' '):
+        qdotPrime = guess[self.qdotIDXs]
+        alignQdotStr = self.dotAligned(qdotPrime)
+        tau = guess[self.tauIDXs]   
+        alignTauStr = self.dotAligned(tau)
+        #should have a dof corresponding to each component of qdot and tau
+        dofs = self.skel.dofs
+        print('\n{} : '.format(name))
+        if(len(dofs) != len(qdotPrime)):
+            print('!!!!!! attempting to print qdot values that do not align with skeleton dofs (different counts)')
+            return
+        if(len(dofs) != len(tau)):
+            print('!!!!!! attempting to print torques that do not align with skeleton dofs (different counts)')
+            return
+        
+        print('\tQdot for dofs : ')        
+        #should have a dof corresponding to each component of tau
+        dofs = self.skel.dofs
+        alignTauStr = self.dotAligned(tau)
+        for i in range(len(dofs)):
+            print('\t\tDof : {:20s} | Qdot : {}'.format(dofs[i].name, alignQdotStr[i]))
+        print('\n\tTorques per dof : ')        
+        for i in range(len(dofs)):
+            print('\t\tDof : {:20s} | Torque : {}'.format(dofs[i].name, alignTauStr[i]))
+
+
+
+#class to hold assisting robot that optimizes for -displacement- not assist force
+class robotArmDispSkelHolder(helperBotSkelHolder):
+                 
+    def __init__(self, env, skel, widx, stIdx, fTipOffset):          
+        helperBotSkelHolder.__init__(self,env, skel,widx,stIdx, fTipOffset)
+        self.name = 'KR5 Helper Arm'
+        self.shortName = 'KR5'
+
+        #set to true to use box constraints
+        self.numOptIters = 100       #bounds magnitude
+        self.useBoxConstraints = False
+        #bound for torques
+        self.bndCnst = 500.0
+        #limit for qdot proposals only if box constraints are set to true - both bot and ana
+        self.qdotLim = 5.0   
+        self.doMatchPose = True
+        #whether we pre-calculate tau-pull per step - only use on force-based policy control
+        self.calcTauPullPerStep = False
+        #has 12 contact dimensions for ANA's foot - 2 per foot
+        self.numCntctDims = 12
+        #desired displacement vector - set upon entry
+        self.desDispVector = np.zeros([3])
+
+    #build list of tuples of idx and multiplier to modify wts array/wts matrix for qdot weighting
+    def buildQdotWtModAra(self):
+        modAra = list()
+        #put dofs to have wt multiplier modification here
+        return modAra
+
+    #initialize nlopt optimizer variables - init ANA's vars here - called 1 time
+    def initOptIndiv(self):
+        #friction value used for optimization calculation
+        ANA_mu = self.groundFric
+        print("robotArmDispSkelHolder::initOptIndiv : Ground Friction coef reported by DART : {}".format(ANA_mu))
+        #value for friction contact cone calc for coulomb approx in optimization - this is just pulled from air
+        self.ANACntctMuCalc = 2.0
+
+        ANA_dofs = self.helpedSkelH.ndofs
+        #obj func deriv for sqrt of sqrd obj func == weights multiplier for obj func using velocities for ANA
+        
+        self.ANA_qdotWtsVec = np.ones(ANA_dofs)
+        #if any dofs should be weighted for obj calc put this here
+
+        #matrix used in object calc for minimizing ana's qdot
+        self.ANA_qdotWts = np.diag(self.ANA_qdotWtsVec)
+
+        #for eef frc minimization objective
+        self.blankEefVec = np.zeros(3)
+        self.eefWtsVec = np.ones(3)
+        self.eefWts = np.diag(self.eefWtsVec)
+
+        #for derivs for accel term and tau
+        self.ANA_dofOnes = np.ones(ANA_dofs)
+        #pre-calc for per-step derivations
+        self.ANA_oneAOvTS = self.ANA_dofOnes/self.perSimStep_dt
+        #negative because subttracted Tau in MA equality constraint
+        self.ANA_tauDot = self.ANA_dofOnes * -1
+        self.ANA_tauDot[0:self.stTauIdx] *=0
+        #matrix of tauDot, for vector constraint gradient
+        self.ANA_tauDotMat = np.diag(self.tauDot)
+        #tolerance for F=MA vector constraint eq -> 1 constraint calc per dof
+        self.ANA_cnstTolMA = np.ones(ANA_dofs) * 1e-8   
+        #tolerance of eef vel matching constraint and bot displacement
+        self.ANA_cnstTolVec = np.ones([3]) * 1e-8
+        #tolerance of slip - per contact
+        self.ANA_cnstTolCNTCT_SLIP = np.ones([12])* 1e-8
+
+        #index array of locations in fcntct array of y component of contact force - should always be positive
+        fcntct_y_idxAra = np.array([1,4,7,10])
+        if(self.useBoxConstraints):
+            #modify lower bound to handle contact bounds - no negative y contact force
+            tolVal= 1e-12
+            offsetYIdxs = (fcntct_y_idxAra + self.cntctStIDX)
+            self.lbndVec[offsetYIdxs] = tolVal     
+        #tolerance for contact calc constraint is last return val
+        self.fcntctUp, self.fcntctDot,  self.ANA_cnstTolCNTCT = self.initCntctStructs(fcntct_y_idxAra, self.cntctStIDX, self.numCntctDims)
+    
+        
+    #return idx's of dofs that are to be matched if pose matching objective is used
+    def initOptPoseData_Indiv(self):
+        #TODO find idxs to match pose - passing empty array
+        return np.empty( shape=(0, 0), dtype=int)     
+
+    #called by base class constructor
+    def getNumOptDims(self) :    
+        # dim of optimization parameters/decision vars->
+        # qdot and tau of robot; qdot, frc_eef and frc_cntct of ANA
+        # self.helpedSkelH.ndofs for ANA, 3 for frc_eef + # of feet*3 for contact forces on each foot - aggregate , mapping to two locations on each foot, to account for possible torques
+        return 2*self.ndofs + self.helpedSkelH.ndofs + 3 + self.numCntctDims 
+
+    #initialize lists of idxs for individual decision variables in x vector
+    def initDecVarRanges_Indiv(self, endIdx):
+        stIdx = endIdx
+        endIdx = stIdx + 3
+        self.eefFrcIDXs = np.arange(stIdx, endIdx)              #eef force for bot/ana
+        stIdx = endIdx
+        endIdx = stIdx + self.helpedSkelH.ndofs
+        self.anaQDotIDXs = np.arange(stIdx, endIdx)             #ana qdot
+        stIdx = endIdx
+        endIdx = stIdx + self.numCntctDims
+        self.cntctStIDX = stIdx
+        self.anaCntctFrcIDXs = np.arange(stIdx, endIdx)         #ana contacts
+
+    #set hard bounds for values, if using
+    def buildOptBounds_Indiv(self): 
+        #limit qdot vals for ANA
+        self.lbndVec[self.anaQDotIDXs] = np.ones(self.anaQDotIDXs.shape)*-self.qdotLim
+        self.ubndVec[self.anaQDotIDXs] = np.ones(self.anaQDotIDXs.shape)*self.qdotLim
+
+    #assistant robot skel's individual per-reset settings
+    def _resetIndiv(self, dispDebug):
+        pass
+    
+    #solve for control for bot given desired control for ANA and passed optimal displacement for ANA's state
+    #ANA and bot are connected via constraints, so we want their eef vels and locations to match
+    def solveBotOptCntrlForDisp(self, _desDispVec):
+        #turn off bot debugging, will still display overall force generated
+        self.debug=False        
+        #set desired displacement
+        self.desDispVector = _desDispVec
+        #initialize & solve - always dynamic for this
+        self.preStepDyn()      
+        #by here control is derived
+        #torque isn't relevant if we are frwrd integrating here 
+        self.applyTau()       
+
+    #constraints specific to this instance, if there are any - here they are assigned to optimization problem, as in comment
+    #and they need to be defined in this class too
+    def setInstanceConstrnts(self):
+        #set constraints for ANA - MA constraint for ANA, vel matching constraint for eef, contact constraints
+        #ANA's F=MA
+        self.optimizer.add_equality_mconstraint(self.MAcnstVec_ANA, self.ANA_cnstTolMA)
+        #EEF vel matching
+        self.optimizer.add_equality_mconstraint(self.EefVelMatchCnst, self.ANA_cnstTolVec)
+        #match desired displacement
+        self.optimizer.add_equality_mconstraint(self.EefDispMatchCnst, self.ANA_cnstTolVec)
+         #ANA's CNTCT force - inequality - this is <= 0
+        self.optimizer.add_inequality_mconstraint(self.CntctValCnstrnt, self.ANA_cnstTolCNTCT)
+        #ANA's no slip - j.dot(qdotdot) - jdot.dot(qdot) @cntcts == 0
+        self.optimizer.add_equality_mconstraint(self.CntctNoSlipConstrnt, self.ANA_cnstTolCNTCT_SLIP)
+       
+    #call this to return objective function value that minimizes velocity and 
+    #returns scalar value
+    #grad is dim n
+    def objFunc(self, x, grad):
+        self.setPrevCurrGuess(x)
+        self.optIters +=1
+        
+        ANAqdotPrime = x[self.anaQDotIDXs]
+        eefFrc = x[self.eefFrcIDXs]
+        qdotPrime = x[self.qdotIDXs]
+        #tau = x[self.tauIDXs]
+        #weight of each component of objective function
+        velWt = 0.30
+        #weight of ana's vel in objective function
+        anaVelWt = 0.35
+        #matching location is assisted by matching target's velocity - 
+        #helps smooth movement when ball has non-zero acceleration and locWt is not weighted very highly
+        #not used here since this is now a constraint
+        #pVelWt= 0.00001        
+        eefWt = 0.35      
+        #match pose, if performed
+        #posePart, poseGrad = self.pose_objFunc(poseWt, qdotPrime)
+        #minimize velocity
+        velPart, velGrad = self.genericObj(velWt, qdotPrime, self.curQdot ,self.qdotWts)   
+        #minimize velocity for ANA 
+        anaVelPart, anaVelGrad = self.genericObj(anaVelWt, ANAqdotPrime, self.ANA_curDq, self.ANA_qdotWts)   
+        #
+        eefFrcPart, eefFrcGrad = self.genericObj(eefWt, eefFrc, self.blankEefVec, self.eefWts)   
+ 
+        funcRes = velPart + anaVelPart + eefFrcPart #+ frcPart
+        
+        if grad.size > 0:
+            #if gradient exists, set it here.  Must be set to 0 for all terms not modified (not initialized to 0 in nlopt)
+            grad[:] = np.zeros(grad.shape)
+
+            #grad calc - put grad in place here
+            #func is .5 * xT * W * x : func' is .5 * (xT * W * WT); W*WT * .5 == W
+            grad[self.qdotIDXs] = velGrad 
+            grad[self.anaQDotIDXs] = anaVelGrad
+            grad[self.eefFrcIDXs] = eefFrcGrad
+            
+
+#            if(frcWt > 0):
+#                grad[self.tauIDXs] = frcGrad
+            
+            #grad[self.tauIDXs] = frcWt *frcDiff
+        #funcRes = sqrt(np.transpose(velDiff).dot(self.qdotWts.dot(velDiff)))
+#        if(self.optIters % (self.numOptIters/10) == 1):
+#            print('objectiveFunc iter : {} velPart : {} | locPt : {} | pt_VelPt : {} |  res : {}'.format(self.optIters,velPart,locPart, pVelPart, funcRes))
+        
+        return funcRes    
+    
+    #per-timestep intializations not covered in setSimVals in parent class
+    #set values relating to ANA here
+    def setSimValsPriv(self):
+        #Mass Matrix == self.skel.M
+        #M is dof x dof 
+        # self.ANA_dofOnes = np.ones(self.helpedSkelH.ndofs)
+        # #negative because subttracted Tau in MA equality constraint
+        # self.ANA_tauDot = self.ANA_dofOnes * -1
+        # self.ANA_tauDot[0:self.stTauIdx] *=0
+        # #matrix of tauDot, for vector constraint gradient
+        # self.ANA_tauDotMat = np.diag(self.tauDot)
+        # #tolerance for F=MA vector constraint eq -> 1 constraint calc per dof
+        # self.ANA_cnstTolMA = np.ones(self.helpedSkelH.ndofs) * 1e-8   
+        print("robotArmDispSkelHolder::setSimValsPriv : Note : ANA's tau must be set to current clamped control from policy before this is called")
+
+        ANAholder = self.helpedSkelH
+
+        #need AnA's eef jacobians here
+        self.ANA_JtPullPInv, self.ANA_JTrans, self.ANA_Jpull, _ = ANAholder.getEefJacobians(self.useLinJacob, body=ANAholder.reachBody, offset=ANAholder.reachBodyOffset)
+        self.ANA_JpullLin = self.ANA_Jpull[-3:,:]
+
+        #quick access to ANA quants    
+        ANA_Skel = ANAholder.skel
+        ANA_M = ANA_Skel.M
+        ANA_curQ = ANA_Skel.q
+        ANA_curDq = ANA_Skel.dq
+ 
+        #calc Jacobian of old qdot ov dt for no-slip contact constraint
+        #self.
+
+        #precalc for eef displacement constraint
+        self.JpullLin_DT = self.JpullLin * self.perSimStep_dt
+
+        #M * qd / dt - precalc for MAconst
+        #M / dt = precalc for MAconst - multiply by qdotPrime
+        ANA_M_ovDt = ANA_M/self.perSimStep_dt
+        #derivative of MA eq w/respect to qdotprime
+        #self.ANA_M_dqdotPrime = ANA_M.dot(self.ANA_oneAOvTS)
+        #precalc -Mqdot/dt
+        self.ANA_NegMqd = -ANA_M_ovDt.dot(ANA_curDq)
+        #CfG == C(q,dq) + G; it is dof x 1 vector
+        self.ANA_CfG = ANA_Skel.coriolis_and_gravity_forces() 
+
+        self.ANA_M = ANA_M
+        self.ANA_M_ovDt = ANA_M_ovDt
+        self.ANA_curQ = ANA_curQ
+        self.ANA_curDq = ANA_curDq
+        #need to set tau that ana received from policy == clampedTau(action)
+        self.ANA_Tau = ANAholder.tau
+        #get contact profile for ANA skeleton from previous step
+        #self.oldCntctData = self.helpedSkelH.getMyContactInfo()        
+        #Jacobian for all contact forces (appended)
+        #world location of opt-derived contact force - vector of 12 x 1 dims
+        self.ANA_JCntct, self.ANA_JCntctDeriv, self.ANA_JtCntctTrans, self.ANA_wrldLocPerFootBody = ANAholder.getCntctJTranspose()
+
+        #ana J cntct accel comp
+        self.ANA_JcntctOvDt = self.ANA_JCntct/self.perSimStep_dt
+        self.ANA_JcntctQdotOvDt = self.ANA_JcntctOvDt.dot(ANA_curDq)
+        #set contact gradient - not needed in vector constraint
+        # self.ANA_JtCntctGrad = np.full_like(self.anaCntctFrcIDXs,0)
+        # for i in range(len(self.anaCntctFrcIDXs)):
+        #     self.ANA_JtCntctGrad[i]=self.ANA_JtCntctTrans[:,i].sum(axis=0)        
+    
+    #equation of motion constraint
+    def MAcnstVec(self, result, x, grad):
+        print('MAcnst iter')
+        qdotPrime = x[self.qdotIDXs]
+        tau = x[self.tauIDXs]
+        eefFrc = x[self.eefFrcIDXs]
+
+        maRes = self.M_ovDt.dot(qdotPrime) + self.NegMqd + self.CfG #- self.CntrntFrc
+        
+        #build pull force and subtract tau estimate
+        #pulling force relative to external force is negative - want opposite direction
+        #in other words, we want the resultant torques to generate this force 
+        tauPull = self.JTrans.dot(eefFrc) - tau
+        
+        result[:] = maRes + tauPull     
+        
+        if grad.size > 0:
+            #grad is matrix of len(result) rows (37) x len(x) cols (74)
+            #if gradient exists, set it here.  Must be set to 0 for all terms not modified
+            grad[:,:] = np.zeros(grad.shape)
+            #gradient for all qdot terms
+            #include change in coriollis forces
+            grad[:,self.qdotIDXs] = self.M_ovDt #+ (CfG-self.CfG)
+            #gradient for all taus - diagonal mat with -1 on diags            
+            grad[:,self.tauIDXs] = self.tauDotMat
+            #gradient for eef frc
+            grad[:,self.eefFrcIDXs] = self.JTrans
+           
+        #return ttlRes#np.sum(np.absolute(ttlVec))    
+
+    #equation of motion constraint for ANA's equations - result is size ana.q
+    def MAcnstVec_ANA(self, result, x, grad):
+        print('MAcnstVec_ANA iter')
+        
+        ANAqdotPrime = x[self.anaQDotIDXs]
+        eefFrc = x[self.eefFrcIDXs]
+        cntctFrcs = x[self.anaCntctFrcIDXs]
+
+        ANA_maRes = self.ANA_M_ovDt.dot(ANAqdotPrime) + self.ANA_NegMqd + self.ANA_CfG #- self.CntrntFrc
+        #values are negative because external - VERIFY
+        tauCntct = -self.ANA_JtCntctTrans.dot(cntctFrcs)
+        #set minus to be opposite direction/sign to bot
+        tauPull = -self.ANA_JTrans.dot(eefFrc) - self.ANA_Tau
+ 
+        result[:] = ANA_maRes + tauPull + tauCntct
+        if grad.size > 0:
+            #grad is matrix of len(result) rows (37) x len(x) cols (74)
+            #if gradient exists, set it here.  Must be set to 0 for all terms not modified
+            grad[:,:] = np.zeros(grad.shape)
+            #gradient for all qdot terms
+            #include change in coriollis forces
+            grad[:,self.anaQDotIDXs] = self.ANA_M_ovDt #+ (CfG-self.CfG)
+            #gradient for eef frc
+            grad[:,self.eefFrcIDXs] = -self.ANA_JTrans
+            #gradient for contact forces
+            grad[:,self.anaCntctFrcIDXs] = -self.ANA_JtCntctTrans
+
+    #match ANA and bot eef velocity - result is size 3 since linear jacobian
+    def EefVelMatchCnst(self, result, x, grad):
+        ANAqdotPrime = x[self.anaQDotIDXs]
+        qdotPrime = x[self.qdotIDXs] 
+        #use linear jacobian so have 3 dof result
+        ANAEefVel = self.ANA_JpullLin.dot(ANAqdotPrime)
+        BotEefVel = self.JpullLin.dot(qdotPrime)
+        result[:] = ANAEefVel - BotEefVel
+        print('EefVelMatchCnst iter : ANA : {}  BOT : {} \n ANA qdot : {} \n BOT  qdot : {}'.format(ANAEefVel,BotEefVel,ANAqdotPrime,qdotPrime))
+        if grad.size > 0:
+            #grad is matrix of len(result) rows (37) x len(x) cols (74)
+            #if gradient exists, set it here.  Must be set to 0 for all terms not modified
+            grad[:,:] = np.zeros(grad.shape)
+            grad[:,self.anaQDotIDXs] = self.ANA_JpullLin 
+            grad[:,self.qdotIDXs] = -self.JpullLin
+
+    #match desired eef displacement - dim 3
+    def EefDispMatchCnst(self, result, x, grad):
+        qdotPrime = x[self.qdotIDXs] 
+        result[:] = self.JpullLin_DT.dot(qdotPrime) - self.desDispVector
+        print('EefDispMatchCnst iter : {} '.format(self.desDispVector))
+
+        if grad.size > 0:
+            #grad is matrix of len(result) rows (37) x len(x) cols (74)
+            #if gradient exists, set it here.  Must be set to 0 for all terms not modified
+            grad[:,:] = np.zeros(grad.shape)
+            grad[:,self.qdotIDXs] = self.JpullLin_DT
+
+    #ANA's no slip constraint from ABE paper - contact won't slide : Jqdotdot + Jdotqdot == 0 - 3 dim
+    def CntctNoSlipConstrnt(self, result, x, grad):
+        print('CntctNoSlipConstrnt iter')
+        ANAqdotPrime = x[self.anaQDotIDXs]
+
+        JQdotdot = self.ANA_JcntctOvDt.dot(ANAqdotPrime) - self.ANA_JcntctQdotOvDt  #j/dt dot (qdot' - qdot) 
+        JdotQdot = self.ANA_JCntctDeriv.dot(ANAqdotPrime)                           #jdot dot qdot'
+        result[:] = JQdotdot + JdotQdot 
+        print('CntctNoSlipConstrnt : ANA_JcntctOvDt :\n {} \n ANA_JcntctQdotOvDt : \n{}\n   ANA_JCntctDeriv : \n{} \n'.format(self.ANA_JcntctOvDt, self.ANA_JcntctQdotOvDt, self.ANA_JCntctDeriv))
+        if grad.size > 0:            
+            #if gradient exists, set it here.  Must be set to 0 for all terms not modified
+            grad[:,:] = np.zeros(grad.shape)
+            grad[:,self.anaQDotIDXs] = self.ANA_JcntctOvDt + self.ANA_JCntctDeriv
+
+    #satisfy contact constraint rule - using tighter box cone - 4 dim
+    def CntctValCnstrnt(self, result, x, grad):
+        cntctFrcs = x[self.anaCntctFrcIDXs]
+        #for each cntct frc f, sqrt(f[0]^2 + f[2]^2) - mu * f[1] <= 0
+        #cntctFrcs == 12elements, == 4 3 element vectors
+        print('CntctValCnstrnt : res shape : {} grad shape : {}'.format(result.shape, grad.shape))
+        tanSqVals = [0,0,0,0]
+        for x in range(0,4):
+            stIdx = 3*x
+            xIdx = stIdx
+            yIdx = stIdx + 1
+            zIdx = stIdx + 2
+            #mag of tangent sqrd - fric * mag of normal sqrd needs to be <= 0
+            tanSqVals[x] =  (cntctFrcs[xIdx]*cntctFrcs[xIdx]) + (cntctFrcs[(stIdx+2)]*cntctFrcs[(stIdx+2)])
+            result[x] = tanSqVals[x] - (self.ANACntctMuCalc *cntctFrcs[yIdx] * self.ANACntctMuCalc *cntctFrcs[yIdx])   
+
+        #print('fCntctCnst result size : {}'.format(np.size(result, axis=0)))
+        if grad.size > 0:            
+            #if gradient exists, set it here.  Must be set to 0 for all terms not modified
+            grad[:,:] = np.zeros(grad.shape)
+            #grad is matrix of 4 rows x size(x) cols 
+            for x in range(0,4):
+                stIdx = 3*x
+                xIdx = stIdx
+                yIdx = stIdx + 1
+                zIdx = stIdx + 2
+                gradVec = np.zeros(cntctFrcs.shape)
+                gradVec[stIdx:stIdx+3] = [2*cntctFrcs[xIdx], -2*self.ANACntctMuCalc*cntctFrcs[yIdx], 2*cntctFrcs[zIdx]]
+                grad[x,self.anaCntctFrcIDXs] = gradVec                
+
+
+    #perform any tests if desired and populate tau                 
+    def doStepTestsAndSetTau_OptCntrl(self):
+        #set tau with best opt result
+        guessTau = self.nextGuess[self.tauIDXs]
+        #evaluate best guess
+        objFuncEval = self.objFunc(self.nextGuess, np.empty(shape=(0,0)))
+        #print('\nOpt Result Eval : {}\n'.format(objFuncEval))
+        passMATest = self.dbg_testMAconstVec(self.nextGuess)
+        #self.dbgShowTorques(guessTau)
+        self.tau = guessTau
+
+    #test a proposed optimization solution to see if it satisfies constraint
+    def dbg_testMAconstVec(self, x, debug=False):
+        result = np.zeros(np.size(self.cnstTolMA))
+        tar = np.zeros(np.size(self.cnstTolMA))
+        self.MAcnstVec(result, x, np.empty(shape=(0,0)))
+        passed = True
+        #result should be all zeros
+        if (not np.allclose(result,  tar, self.cnstTolMA)):
+            print('!!!!!!!!!!!!!!!!! MAcnstVec constraint violated : ')
+            passed = False
+            if(not debug):
+                for x in result:
+                    print('\t{}'.format(x))  
+        #else:
+        #    print('MAcnstVec satisfied by result')
+        if(debug):
+            for x in result:
+                print('\t{}'.format(x))  
+        return passed
 
 
     #individual skeleton handling for calculating post-step dynamic state dictionary

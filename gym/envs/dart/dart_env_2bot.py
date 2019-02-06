@@ -396,7 +396,7 @@ class DartEnv2Bot(gym.Env):
                 
                 j.set_damping_coefficient(didx, kd)
                 j.set_spring_stiffness(didx, ks)
-        print('{}-type Skel is using ks val : {} and kd val : {}'.format(skel.name.lower(),ks, kd))
+        print('DartEnv2Bot::_fixJointVals : {}-type Skel is using ks val : {} and kd val : {}'.format(skel.name.lower(),ks, kd))
     
     #init either human or robot skeleton
     def _initLoadedSkel(self, skel, widx, skelType):    
@@ -413,7 +413,7 @@ class DartEnv2Bot(gym.Env):
 
         #fixed robot arm has no fixed world dofs
         numActDofs = skel.ndofs - stIDX
-        print('Skel : {} has {} dofs and {} act dofs'.format(skel.name,skel.ndofs, numActDofs))
+        print('DartEnv2Bot::_initLoadedSkel : : Skel : {} has {} dofs and {} act dofs'.format(skel.name,skel.ndofs, numActDofs))
 
         #base pose to use - only prone skeleton will deviate from this; AK's trained policy must use old skeleton
         basePose = self.getPoseVals('seated',skel, skelType)  
@@ -454,10 +454,11 @@ class DartEnv2Bot(gym.Env):
             rchHandStrName = 'r-lowerarm'
             bodyNamesAra = [['l-foot'],['r-foot'], ['l-lowerarm','r-lowerarm'], 'head']
             kneeDofIDXs = [9,15]
-        elif('Bot_Arm' in skelType):
+        elif('Bot_Arm' in skelType):#kr5 bot arm and other bot_arm
             self._fixJointVals(skel, kd=0.0, ks=0.0)
             eefOffset = np.array([.05,0,0])
-            skelH = robotArmSkelHolder(self, skel, widx, stIDX, fTipOffset=eefOffset)  
+            #get appropriate arm skel holder to use, based on which environment
+            skelH = self.getBotSkelHldr(skel, widx, stIDX, eefOffset)
 
             rchHandStrName = 'palm'
             #turn off collisions - NOTE This is for debugging only
@@ -487,7 +488,10 @@ class DartEnv2Bot(gym.Env):
         skelH.setInitialSkelParams(bodyNamesAra, kneeDofIDXs, rchHandStrName, skelType, basePose, actSclBase, actSclIdxMult)
 
         return skelH
-    
+    #build appropriate bot arm skel holder for this environment
+    def getBotSkelHldr(self, skel, widx, stIDX, eefOffset):
+        raise NotImplementedError() 
+
     #implement this in environments to return appropriate, environment-dependent, assistance component of ANA's observation space
     #all environments supporting skelHldrs need to implement this method and the next one
     def getSkelAssistObs(self, skelHldr):
@@ -502,7 +506,7 @@ class DartEnv2Bot(gym.Env):
             body.set_collidable(canCollide)
 
     def _setSkelNoCollide(self, skel, skelName):
-        print('!!!!! NOTE : {} has no collisions enabled'.format(skelName))
+        print('DartEnv2Bot::_setSkelNoCollide : !!!!! NOTE : {} has no collisions enabled'.format(skelName))
         self._setSkelCollidable(skel, False)
         
     #get skeleton objects from list in dart_world  
@@ -534,7 +538,7 @@ class DartEnv2Bot(gym.Env):
                 #skel file name specifies which kima model is used : old which used old joint limits, otherwise newer kima (in 6.4 dart) which uses different joint config and limits
                 isOldSkel = ('old' in skelName.lower() )
                 skelType = 'KimaOld' if isOldSkel else 'KimaNew'
-                print('Using Kima Skel File version : {}'.format(skelType))
+                print('DartEnv2Bot::_buildskelhldrs : Using Kima Skel File version : {}'.format(skelType))
                 self.humanIdx = skelType
                 #track getup humanoid in rendering
                 #self.track_skeleton_id = idx
@@ -591,19 +595,19 @@ class DartEnv2Bot(gym.Env):
                 self.hasHelperBot=True
                 
             else :
-                print('Skel Unknown : {}'.format(skelName))
+                print('DartEnv2Bot::_buildskelhldrs : Skel Unknown : {}'.format(skelName))
                 
             skel.friction = self.groundFric
-
+            #if using skel in skel holder
             if saveSkel :
                 self.skelHldrs[skelType]= self._initLoadedSkel(skel, idx, skelType)
                 saveSkel = False
         
-            print('Name : {} Type : {} Index : {} #dofs {} #nodes {} initial root loc : {}'.format(skelName, skelType,idx, skel.ndofs, skel.nbodies, skel.positions()[:6]))
+            print('DartEnv2Bot::_buildskelhldrs : Name : {} Type : {} Index : {} #dofs {} #nodes {} initial root loc : {}'.format(skelName, skelType,idx, skel.ndofs, skel.nbodies, skel.positions()[:6]))
         #give robot a ref to human skel handler if robot is there
         if (self.hasHelperBot):
             self.skelHldrs[self.botIdx].setHelpedSkelH(self.skelHldrs[self.humanIdx])
-        print('dart_env_2bot::_buildskelhldrs finished\n\n')
+        print('DartEnv2Bot::_buildskelhldrs : finished\n\n')
 
     #return jacobians of either robot or human contact point
     #for debugging purposes to examine jacboian

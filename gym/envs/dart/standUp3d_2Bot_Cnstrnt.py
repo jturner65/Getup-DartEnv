@@ -7,6 +7,7 @@ import numpy as np
 from gym import utils
 from gym.envs.dart import assist2bot_env
 from os import path
+from skelHolders import robotArmSkelHolder, robotArmDispSkelHolder
 
 from collections import defaultdict
 
@@ -62,10 +63,13 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
 
         #initialize all force and trajectory values: extAssistSize=6 will add force application location target to observation
         #NOTE :if bot is connected and actively solving, trajectory _MUST_ be passive or explodes
-        forcePassive = False
+        #set forcePassive to true, setTrajDyn to true to use optimization process
+        #set forcePassive and setTrajDyn to false, use robotArmSkelHolder, to demo behavior
+        #set to false to use IK
+        forcePassive = True
         #trajTyp = 'servo'       #servo joint cannot be moved by external force - can train with servo, but to use bot must use freejoint
         trajTyp = 'gauss'       #gauss joint cannot be solved dynamically, must be displaced kinematically, or else set to passive
-        self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp=trajTyp, setTrajDynamic=False, setTrajPassive=forcePassive)#(self.connectBot or forcePassive))
+        self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp=trajTyp, setTrajDynamic=True, setTrajPassive=forcePassive)#(self.connectBot or forcePassive))
         #self.initAssistTrajVals(extAssistSize=3, useANAHeightTraj=False,  trajTyp='gauss', setTrajDynamic=True, setTrajPassive=False)
         
         #whether or not to stop when trajectory is finished
@@ -92,6 +96,11 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         self.setTrainAndInitBotState(self.trainPolicy, botDict=botDict)    
 
         utils.EzPickle.__init__(self)
+
+    #return appropriate robot arm skel holder for this environment
+    def getBotSkelHldr(self, skel, widx, stIDX, eefOffset):
+        #return robotArmSkelHolder(self, skel, widx, stIDX, fTipOffset=eefOffset)
+        return robotArmDispSkelHolder(self, skel, widx, stIDX, fTipOffset=eefOffset) 
 
     #individual environment-related components of assist initialization
     def initAssistTraj_indiv(self): 
@@ -140,58 +149,70 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         #conversely, should check if ANA is done successfully or if ANA failed
         return 0
 
-    #returns optimal displacement and action from policy query with opt displacement
-    def getANAActionForOptDisp(self, ANAObs, lastAction, policy, useDet):
-        #query VF with current ana state to get optimal displacement
+    #returns optimal displacement and action from policy query with opt displacement for current ANA state
+    def getOptDispAndANAAction(self, ANAObs, lastAction, policy, useDet):
+        #get displacement component of current observation
         _,initTardisp,_ = self.getObsComponents(ANAObs)
-        tarDisp, _ = self.getTargetAssist(ANAObs)
-        #print("Init Tar Disp : {} VF Tar Disp : {}".format(initTardisp, tarDisp))
-        if (np.allclose(initTardisp,tarDisp)):#if not changing traj (opt tar is very close to expected tar), then policy won't change either
-            return lastAction, tarDisp
+        #query VF with current ana state to get optimal displacement
+        tarDisp, _ = self.getVFTargetAssist(ANAObs) 
+        print("standUp3d_2Bot_Cnstrnt::getOptDispAndANAAction : Init Tar Disp : {} VF Tar Disp : {}".format(initTardisp, tarDisp))
 
-        #TODO forcing target displacement to be initial displacement (i.e. ignoring vf pred) - only do this until vf has been retrained to provide good displacements
-        tarDisp = initTardisp
+        #TODO forcing target displacement to be initial displacement (i.e. ignoring vf pred) - only do this until vf process is operational        
+        useDisp = initTardisp # tarDisp
         #set target displacement for tajectory
-        self.trackTraj.setVFTrajObs("disp",tarDisp)
+        #self.trackTraj.setVFTrajObs("disp",useDisp)
+        self.trackTraj.setOptDeriveMovVec(useDisp)
 
-        if (policy is None):
-            return lastAction, tarDisp
-        else :
-            action, actionStats = policy.get_action(ANAObs)
-            if(useDet):#deterministic policy - use mean
-                action = actionStats['mean']
-        return action, tarDisp
+        #if not changing traj (opt tar is very close to expected tar), then policy won't change either
+        if (policy is None) or (np.allclose(initTardisp,tarDisp)):
+            return lastAction, tarDisp, initTardisp, useDisp
 
-    #query value function, find ideal assist displacement given ANA's state, 
-    #frwrd sim ANA to find ext seen at ANA's eef to generate this displacement. restore ANA
-    #find bot control to synthesize this force at eef
-    def findBotDispCntrl_DispFrc(self, ANA, bot, lastAction, policy, useDet):
-        ANAObs = ANA.getObs()
-        action, tarDisp = self.getANAActionForOptDisp(ANAObs, lastAction, policy, useDet)
+        #get new observation vector with this optimal action, use to query new policy
+        newANAObs = np.copy(ANAObs)
+        newANAObs[-(len(useDisp)):] = useDisp
+        action, actionStats = policy.get_action(newANAObs)
         
-        #Step sim forward with passive bot to get ANA's eef force dictionary for given action and target displacement, to see how much force the bot should generate 
-        eefFrc = self.stepFrwrdThenRestore(action)
+        if(useDet):#deterministic policy - use mean
+            action = actionStats['mean']
+        return action, tarDisp, initTardisp, useDisp
+
+    # #given ANA's current state, we find the appropriate control for the assitant bot
+    # def findBotControlViaOptimization(self, ANA, ANAObs, bot, lastAction, policy, useDet):
+    #     #first determine optimal displacement given ANA's current state
+    #     action, tarDisp, initTardisp, useDisp = self.getOptDispAndANAAction(ANAObs, lastAction, policy, useDet)
+
+    #     return lastAction
+
+    # #query value function, find ideal assist displacement given ANA's state, 
+    # #frwrd sim ANA to find ext seen at ANA's eef to generate this displacement. restore ANA
+    # #find bot control to synthesize this force at eef
+    # def findBotDispCntrl_DispFrc(self, ANA, ANAObs, bot, lastAction, policy, useDet):
+    #     ANAObs = ANA.getObs()
+    #     action, tarDisp, origDisp, useDisp = self.getOptDispAndANAAction(ANAObs, lastAction, policy, useDet)
+        
+    #     #Step sim forward with passive bot to get ANA's eef force dictionary for given action and target displacement, to see how much force the bot should generate 
+    #     eefFrc = self.stepFrwrdThenRestore(action)
                   
-        #derive the control torque via optimization necessary to generate force seen at EEF by ANA
-        #bot.frwrdSimBot_DispToFrc(-1*eefFrc, dbgFrwrdStep=True)
-        bot.frwrdSimBot_DispToFrc(eefFrc, dbgFrwrdStep=True)
-        #
+    #     #derive the control torque via optimization necessary to generate force seen at EEF by ANA
+    #     #bot.frwrdSimBot_DispToFrc(-1*eefFrc, dbgFrwrdStep=True)
+    #     #bot.frwrdSimBot_DispToFrc(eefFrc, dbgFrwrdStep=True)
+    #     #
         
-        #use ANA observation in policy to get appropriate action
-        if (policy is None):
-            return lastAction
-        else :
-            action, actionStats = policy.get_action(ANAObs)
-            if(useDet):#deterministic policy - use mean
-                action = actionStats['mean']
-        return action      
+    #     #use ANA observation in policy to get appropriate action
+    #     if (policy is None):
+    #         return lastAction
+    #     else :
+    #         action, actionStats = policy.get_action(ANAObs)
+    #         if(useDet):#deterministic policy - use mean
+    #             action = actionStats['mean']
+    #     return action      
     
     #query value function, find ideal assist given ANA's state, find necessary bot control to provide this assist
     #will set bot's tau, and will return new control for ANA
     #Not used
-    # def findBotDispCntrl_IKSPD(self, ANA, bot, lastAction, policy, useDet):
+    # def findBotDispCntrl_IKSPD(self, ANA, ANAObs, bot, lastAction, policy, useDet):
     #     ANAObs = ANA.getObs()
-    #     action, tarDisp = self.getANAActionForOptDisp(ANAObs, lastAction, policy, useDet)
+    #     action, tarDisp, origDisp, useDisp = self.getOptDispAndANAAction(ANAObs, lastAction, policy, useDet)
     #     #query VF with current ana state           
     #     #derive the control torque by determining the new pose for the assistant robot given the desired displacement
     #     bot.frwrdSimBot_DispIKSPD(tarDisp, dbgFrwrdStep=False)
@@ -218,7 +239,7 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         policy = self.ANAPolicy
         useDet = not self.useRndPol
         #vfOptObj = self.vfOptObj
-        print('Using Bot Assist for step {}'.format(self.sim_steps))
+        print('Using Bot Assist for step {} | Policy exists : {} | using policy mean : {} '.format(self.sim_steps, (policy!=None), useDet))
         actionsUsed = []
         #forward simulate  - dummy res dict
         resDict = {'broken':False, 'frame':self.frame_skip, 'skelhldr':'None', 'reason':'OK', 'skelState':self.skelHldrs[self.humanIdx].state_vector()}
@@ -226,21 +247,30 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
         fr = 0
         lastAction = a
         action = a
+
         #iterate every frame step, until done
         while (not done) and (fr < self.frame_skip):  
             fr +=1  
-            #find best ANA action given ANAObs
-            action = self.findBotDispCntrl_DispFrc(ANA, bot, lastAction, policy, useDet)
-            #action = self.findBotDispCntrl_IKSPD(ANA, bot, lastAction,  policy, useDet)
-
-            #allow traj component to evolve - if is passive, just use to synthesize approximation for next displacement 
-            self.doneTracking = self.stepTraj(fr)               
+            #get ANA's current observed state
+            ANAObs = ANA.getObs()            
+            #find best action for ANA based on optimal displacement for current state
+            #tarDisp is vf pred proposal for best displacement, initTarDisp is displacement from observation (displacement set from trajectory evolution)
+            # useDisp is displacement being used to generate new observation/control (either tarDisp orr initTarDisp - this is here for debugging optimization)
+            action, tarDisp, initTarDisp, useDisp = self.getOptDispAndANAAction(ANAObs, lastAction, policy, useDet)
 
             actionsUsed.append(action)
             #do not call prestep with new action in ANA, this will corrupt reward function, since initial COM used for height and height vel calcs is set in prestep before frameskip loops
             #set clamped tau in ana to action
             ANA.tau=ANA.setClampedTau(action) 
-            
+
+            #set displacement for bot to use in optimization - only defined for robotArmDispSkelHolder class 
+            #solves for bot torque and applies to bot
+            bot.solveBotOptCntrlForDisp(useDisp)
+            #allow traj component to evolve - if is passive, just use to synthesize approximation for next displacement 
+            self.doneTracking = self.stepTraj(fr)        
+
+            input()       
+           
             #step all skels
             #apply all torques to skeletons
             for _,v in self.skelHldrs.items():
@@ -392,7 +422,10 @@ class DartStandUp3dAssistEnvCnstrnt(assist2bot_env.DartAssist2Bot_Env, utils.EzP
     #return a random assist value to initialize vf Opt
     def getRandomAssist(self, assistBnds):
         #return random assist value within bounds - this is seed value for vfOpt - use current value 
-        res = self.trackTraj.getTrajObs('disp')#self.trackTraj.getRandDispVal()
+        #TODO this is currently not random on every call
+        res = self.trackTraj.getTrajObs('disp')
+        #uncomment below to get random assist displacement
+        #res = self.trackTraj.getRandDispVal()
         return res
 
     #set environment-specific values from external call for integrating bot and ana
